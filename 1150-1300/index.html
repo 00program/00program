@@ -14,12 +14,6 @@
   #cache { font-size:24px; color:#5c6672; margin:0 0 10px; min-height:14px; }
   #cache.cacheok { color:#7fd0a0; }
   .ok { color:#7fd0a0; } .bad { color:#d08a7f; } .warn { color:#d8c07f; }
-  #brand { text-align:center; padding:8px 10px; background:#0e1116;
-           border-bottom:1px solid #1e2732; }
-  #brand img { width:28px; height:28px; margin-right:8px; border-radius:50%;
-               vertical-align:middle; }
-  #brand b { font-size:30px; font-weight:700; letter-spacing:.14em;
-             color:#e6ebf2; vertical-align:middle; }
 </style>
 </head>
 <body>
@@ -37,6 +31,19 @@
     function setState(t, c) { stateEl.textContent = t; stateEl.className = c || ""; }
     function setCache(t, ok) { cacheEl.textContent = t; cacheEl.className = ok ? "cacheok" : ""; }
     var params = new URLSearchParams(location.search);
+
+    // Bloqueo persistente: si una corrida anterior dejó el kernel sucio, no
+    // permitimos arrancar de nuevo hasta que se reinicie.
+    var DIRTY_KEY = "ps4lab_kernel_dirty";
+    var dirty = null;
+    try { dirty = localStorage.getItem(DIRTY_KEY); } catch (e) {}
+    if (dirty === "1" && !params.has("force")) {
+        setState("REBOOT REQUIRED -- kernel marked dirty", "bad");
+        detEl.innerHTML = "A previous run left the kernel in an inconsistent "
+            + "state. Power off and on the console. Use ?force=1 to override "
+            + "at your own risk.";
+        return;
+    }
 
     var key = null, fwnum = null;
     var m = /PlayStation\s+4[\/ ](\d+)\.(\d+)/.exec(navigator.userAgent);
@@ -62,7 +69,6 @@
     }
     detEl.innerHTML = "firmware <b>" + (key || "unknown") + "</b>"
         + " &middot; bug <b>" + (bug || "none") + "</b> &middot; " + why;
-
     if (!bug) { setState("UNSUPPORTED FIRMWARE", "bad"); return; }
 
     var target = (bug === "lapse" ? "run_lapse.html" : "run_poops.html")
@@ -82,15 +88,10 @@
     }
 
     var ac = window.applicationCache;
-    if (!ac || !document.documentElement.hasAttribute("manifest")) {
-        go();
-    } else if (!navigator.onLine) {
-        setCache("offline -- from cache", true);
-        go();
-    } else if (ac.status === ac.IDLE) {
-        setCache("cached", true);
-        go();
-    } else if (ac.status === ac.UPDATEREADY) {
+    if (!ac || !document.documentElement.hasAttribute("manifest")) { go(); }
+    else if (!navigator.onLine) { setCache("offline -- from cache", true); go(); }
+    else if (ac.status === ac.IDLE) { setCache("cached", true); go(); }
+    else if (ac.status === ac.UPDATEREADY) {
         try { ac.swapCache(); } catch (e) {}
         setCache("update downloaded", true);
         waitForTap("UPDATE READY -- Tekan tombol Enter  X/O",
@@ -103,7 +104,6 @@
             if (e && e.total)
                 setCache("caching " + Math.round((e.loaded / e.total) * 100) + "%");
         }, false);
-
         ac.addEventListener("cached", function () {
             setCache("cached for offline use", true);
             waitForTap("CACHED (first run) -- Tekan tombol Enter  X/O", go);
@@ -114,10 +114,8 @@
             waitForTap("UPDATE READY -- Tekan tombol Enter  X/O",
                        function () { location.reload(); });
         }, false);
-
         ac.addEventListener("noupdate", function () {
-            setCache("cached -- offline ready", true);
-            go();
+            setCache("cached -- offline ready", true); go();
         }, false);
         ac.addEventListener("error", function () {
             setCache("cache unavailable");
@@ -125,7 +123,7 @@
         }, false);
         ac.addEventListener("obsolete", function () {
             setCache("cache obsolete");
-            waitForTap("CACHE OBSOLETE -- Tekan tombol Enter  X/O", go);
+            waitForTap("CACHE OBSTOLETE -- Tekan tombol Enter  X/O", go);
         }, false);
     }
 })();
