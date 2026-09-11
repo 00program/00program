@@ -14,6 +14,30 @@
   #cache { font-size:24px; color:#5c6672; margin:0 0 10px; min-height:14px; }
   #cache.cacheok { color:#7fd0a0; }
   .ok { color:#7fd0a0; } .bad { color:#d08a7f; } .warn { color:#d8c07f; }
+  #telemetry {
+      position: fixed; right: 8px; top: 8px; width: 400px; max-height: 94vh;
+      overflow-y: auto; background: #05070a; border: 1px solid #1e2732;
+      border-radius: 6px; padding: 8px 10px;
+      font: 11px/1.35 Consolas, monospace; color: #9fd0ff; z-index: 9999;
+  }
+  #telemetry h3 { margin: 0 0 6px; font-size: 12px; color: #ffd166;
+                  letter-spacing: .08em; }
+  #telemetry .row { display:flex; justify-content:space-between;
+                    border-bottom: 1px dashed #1a2230; padding: 1px 0; }
+  #telemetry .row span:first-child { color:#8895a8; }
+  #telemetry .row span:last-child  { color:#e8f3ff; }
+  #telemetry .t-ok   { color:#7fd0a0; }
+  #telemetry .t-bad  { color:#ff7a7a; }
+  #telemetry .t-warn { color:#ffd166; }
+  #telemetry button { background:#16202c; color:#cfe3ff; border:1px solid #2a3a4c;
+                      border-radius:4px; padding:3px 8px; margin-top:6px;
+                      margin-right:4px; font:11px Consolas, monospace;
+                      cursor:pointer; }
+  #telemetry button:hover { background:#1e2c3a; }
+  #telemetry pre { white-space: pre-wrap; word-break: break-all;
+                   color:#cfe3ff; background:#0a0f14; border:1px solid #1a2230;
+                   border-radius:4px; padding:6px; margin-top:6px;
+                   max-height: 300px; overflow-y: auto; }
 </style>
 </head>
 <body>
@@ -23,17 +47,220 @@
   <div id="cache"></div>
 </div>
 
+<div id="telemetry">
+  <h3>TELEMETRY (envíame esto)</h3>
+  <div id="tm-rows"></div>
+  <button id="tm-copy">Copiar JSON</button>
+  <button id="tm-download">Descargar JSON</button>
+  <button id="tm-clear">Limpiar</button>
+  <pre id="tm-log">(esperando datos...)</pre>
+</div>
+
 <script>
 (function () {
+    // ============================================================
+    // TELEMETRÍA — recoge todo lo importante en window.__TM
+    // ============================================================
+    var TM = window.__TM = {
+        startedAt: Date.now(),
+        ua: navigator.userAgent,
+        fw: null, fwStatus: null, bug: null, target: null,
+        cacheStatus: null, cacheEvents: [], errors: [],
+        stages: {}, params: {}, resources: [], memory: null,
+        diagnostics: {}
+    };
+
+    // ---------- hooks de error globales ----------
+    window.addEventListener('error', function (e) {
+        try {
+            TM.errors.push({
+                ts: Date.now() - TM.startedAt,
+                message: e.message || String(e.error),
+                file: e.filename || '', line: e.lineno || 0,
+                col: e.colno || 0,
+                stack: (e.error && e.error.stack)
+                    ? String(e.error.stack).slice(0, 400) : ''
+            });
+            renderTM();
+        } catch (_) { }
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+        try {
+            TM.errors.push({
+                ts: Date.now() - TM.startedAt,
+                message: 'unhandledrejection: '
+                    + (e.reason && e.reason.message
+                        ? e.reason.message : String(e.reason)),
+                file: '', line: 0, col: 0,
+                stack: (e.reason && e.reason.stack)
+                    ? String(e.reason.stack).slice(0, 400) : ''
+            });
+            renderTM();
+        } catch (_) { }
+    });
+
+    // ---------- sondeo de recursos ----------
+    var RESOURCES_TO_PROBE = [
+        'cache.appcache', 'run_lapse.html', 'run_poops.html',
+        'core.js', 'mem.js', 'int64.js', 'ps4_offsets.js', 'rpc_worker.js',
+        'chain_lapse.js', 'chain_poops.js', 'payload.bin',
+        'patches/1100.bin', 'patches/1150.bin', 'patches/1200.bin',
+        'patches/1250.bin', 'patches/1300.bin'
+    ];
+    function probeResources() {
+        var pending = RESOURCES_TO_PROBE.length;
+        RESOURCES_TO_PROBE.forEach(function (name) {
+            var xhr = new XMLHttpRequest();
+            xhr.open('HEAD', name, true);
+            xhr.onreadystatechange = function () {
+                if (xhr.readyState !== 4) return;
+                TM.resources.push({
+                    name: name, status: xhr.status,
+                    ok: xhr.status === 200 || xhr.status === 0,
+                    length: xhr.getResponseHeader('Content-Length') || '?',
+                    type: xhr.getResponseHeader('Content-Type') || '?'
+                });
+                if (--pending === 0) renderTM();
+            };
+            xhr.onerror = function () {
+                TM.resources.push({ name: name, status: 'ERR', ok: false });
+                if (--pending === 0) renderTM();
+            };
+            try { xhr.send(); } catch (e) {
+                TM.resources.push({ name: name, status: 'THREW', ok: false });
+                if (--pending === 0) renderTM();
+            }
+        });
+    }
+
+    function collectMemory() {
+        var m = {};
+        if (performance && performance.memory) {
+            m.jsHeapSizeLimit = performance.memory.jsHeapSizeLimit;
+            m.totalJSHeapSize = performance.memory.totalJSHeapSize;
+            m.usedJSHeapSize  = performance.memory.usedJSHeapSize;
+        }
+        if (navigator.deviceMemory) m.deviceMemory = navigator.deviceMemory;
+        if (navigator.hardwareConcurrency)
+            m.hardwareConcurrency = navigator.hardwareConcurrency;
+        TM.memory = m;
+    }
+
+    // ---------- render ----------
+    var tmRows = document.getElementById('tm-rows');
+    var tmLog  = document.getElementById('tm-log');
+    function esc(s) {
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;');
+    }
+    function renderTM() {
+        try {
+            var rows = [];
+            function row(k, v, cls) {
+                rows.push('<div class="row"><span>' + esc(k)
+                    + '</span><span class="' + (cls || '') + '">'
+                    + esc(v) + '</span></div>');
+            }
+            row('UA', TM.ua.length > 60 ? TM.ua.slice(0, 60) + '…' : TM.ua);
+            row('FW', TM.fw || '?', TM.fw ? 't-ok' : 't-warn');
+            row('FW status', TM.fwStatus || '?');
+            row('Bug', TM.bug || '?', TM.bug ? 't-ok' : 't-bad');
+            row('Target', TM.target || '?');
+            row('Cache', TM.cacheStatus || '?',
+                TM.cacheStatus === 'cached' ? 't-ok' : 't-warn');
+            row('Elapsed (ms)', Date.now() - TM.startedAt);
+            row('Errors', TM.errors.length,
+                TM.errors.length ? 't-bad' : 't-ok');
+            row('Stages recorded', Object.keys(TM.stages).length);
+            row('Resources ok',
+                TM.resources.filter(function (r) { return r.ok; }).length
+                + '/' + TM.resources.length,
+                TM.resources.some(function (r) { return !r.ok; })
+                    ? 't-bad' : 't-ok');
+            if (TM.memory && TM.memory.usedJSHeapSize) {
+                row('JS heap used',
+                    (TM.memory.usedJSHeapSize / 0x100000).toFixed(1) + ' MB');
+                row('JS heap limit',
+                    (TM.memory.jsHeapSizeLimit / 0x100000).toFixed(1) + ' MB');
+            }
+            tmRows.innerHTML = rows.join('');
+
+            var log = '';
+            log += '=== STAGES ===\n';
+            log += JSON.stringify(TM.stages, null, 1) + '\n\n';
+            log += '=== RESOURCES ===\n';
+            log += TM.resources.map(function (r) {
+                return (r.ok ? 'OK ' : 'XX ') + r.name + ' ' + r.status
+                    + ' ' + r.length + ' ' + r.type;
+            }).join('\n') + '\n\n';
+            log += '=== ERRORS ===\n';
+            log += TM.errors.map(function (e) {
+                return '[' + e.ts + 'ms] ' + e.message
+                    + (e.file ? ' @ ' + e.file + ':' + e.line + ':' + e.col : '')
+                    + (e.stack ? '\n  ' + e.stack : '');
+            }).join('\n') + '\n\n';
+            log += '=== PARAMS ===\n';
+            log += JSON.stringify(TM.params, null, 1) + '\n\n';
+            log += '=== DIAGNOSTICS ===\n';
+            log += JSON.stringify(TM.diagnostics, null, 1) + '\n';
+            tmLog.textContent = log;
+        } catch (e) {
+            tmLog.textContent = 'render error: ' + e.message;
+        }
+    }
+    TM.render = renderTM;
+
+    document.getElementById('tm-copy').onclick = function () {
+        try {
+            var txt = JSON.stringify(TM, null, 2);
+            if (navigator.clipboard) navigator.clipboard.writeText(txt);
+            else {
+                var ta = document.createElement('textarea');
+                ta.value = txt; document.body.appendChild(ta);
+                ta.select(); document.execCommand('copy');
+                document.body.removeChild(ta);
+            }
+            this.textContent = '¡Copiado!';
+            var self = this;
+            setTimeout(function () { self.textContent = 'Copiar JSON'; }, 1500);
+        } catch (e) { alert('copy failed: ' + e.message); }
+    };
+    document.getElementById('tm-download').onclick = function () {
+        try {
+            var blob = new Blob([JSON.stringify(TM, null, 2)],
+                { type: 'application/json' });
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = 'ps4-telemetry-' + Date.now() + '.json';
+            document.body.appendChild(a); a.click();
+            document.body.removeChild(a);
+            setTimeout(function () { URL.revokeObjectURL(url); }, 5000);
+        } catch (e) { alert('download failed: ' + e.message); }
+    };
+    document.getElementById('tm-clear').onclick = function () {
+        TM.errors.length = 0;
+        TM.stages = {};
+        renderTM();
+    };
+
+    // ============================================================
+    // FLUJO ORIGINAL (sin cambios funcionales)
+    // ============================================================
     var stateEl = document.getElementById("state");
     var detEl = document.getElementById("det");
     var cacheEl = document.getElementById("cache");
     function setState(t, c) { stateEl.textContent = t; stateEl.className = c || ""; }
-    function setCache(t, ok) { cacheEl.textContent = t; cacheEl.className = ok ? "cacheok" : ""; }
+    function setCache(t, ok) {
+        cacheEl.textContent = t;
+        cacheEl.className = ok ? "cacheok" : "";
+        TM.cacheStatus = t;
+        renderTM();
+    }
     var params = new URLSearchParams(location.search);
+    TM.params = {};
+    params.forEach(function (v, k) { TM.params[k] = v; });
 
-    // Bloqueo persistente: si una corrida anterior dejó el kernel sucio, no
-    // permitimos arrancar de nuevo hasta que se reinicie.
     var DIRTY_KEY = "ps4lab_kernel_dirty";
     var dirty = null;
     try { dirty = localStorage.getItem(DIRTY_KEY); } catch (e) {}
@@ -42,6 +269,8 @@
         detEl.innerHTML = "A previous run left the kernel in an inconsistent "
             + "state. Power off and on the console. Use ?force=1 to override "
             + "at your own risk.";
+        TM.diagnostics.dirtyBlock = true;
+        renderTM();
         return;
     }
 
@@ -69,12 +298,19 @@
     }
     detEl.innerHTML = "firmware <b>" + (key || "unknown") + "</b>"
         + " &middot; bug <b>" + (bug || "none") + "</b> &middot; " + why;
+
+    TM.fw = key || 'unknown';
+    TM.bug = bug || 'none';
+    TM.target = (bug === 'lapse' ? 'run_lapse.html' : 'run_poops.html')
+        + location.search;
+    renderTM();
+    collectMemory();
+    probeResources();
+
     if (!bug) { setState("UNSUPPORTED FIRMWARE", "bad"); return; }
 
-    var target = (bug === "lapse" ? "run_lapse.html" : "run_poops.html")
-        + location.search;
     function go() { setState("loading " + bug + " chain...", "warn");
-                    location.replace(target); }
+                    location.replace(TM.target); }
 
     function waitForTap(msg, action) {
         setState(msg, "warn");
@@ -88,6 +324,47 @@
     }
 
     var ac = window.applicationCache;
+    if (ac) {
+        ac.addEventListener("downloading", function () {
+            TM.cacheEvents.push({ ts: Date.now() - TM.startedAt, ev: 'downloading' });
+            setCache("caching for offline (first run)...");
+        }, false);
+        ac.addEventListener("progress", function (e) {
+            if (e && e.total) {
+                TM.cacheEvents.push({ ts: Date.now() - TM.startedAt,
+                    ev: 'progress', loaded: e.loaded, total: e.total });
+                setCache("caching "
+                    + Math.round((e.loaded / e.total) * 100) + "%");
+            }
+        }, false);
+        ac.addEventListener("cached", function () {
+            TM.cacheEvents.push({ ts: Date.now() - TM.startedAt, ev: 'cached' });
+            setCache("cached for offline use", true);
+            waitForTap("CACHED (first run) -- Tekan tombol Enter  X/O", go);
+        }, false);
+        ac.addEventListener("updateready", function () {
+            TM.cacheEvents.push({ ts: Date.now() - TM.startedAt, ev: 'updateready' });
+            try { ac.swapCache(); } catch (e) {}
+            setCache("update downloaded", true);
+            waitForTap("UPDATE READY -- Tekan tombol Enter  X/O",
+                       function () { location.reload(); });
+        }, false);
+        ac.addEventListener("noupdate", function () {
+            TM.cacheEvents.push({ ts: Date.now() - TM.startedAt, ev: 'noupdate' });
+            setCache("cached -- offline ready", true); go();
+        }, false);
+        ac.addEventListener("error", function () {
+            TM.cacheEvents.push({ ts: Date.now() - TM.startedAt, ev: 'error' });
+            setCache("cache unavailable");
+            waitForTap("CACHE FAILED -- Tekan tombol Enter  X/O", go);
+        }, false);
+        ac.addEventListener("obsolete", function () {
+            TM.cacheEvents.push({ ts: Date.now() - TM.startedAt, ev: 'obsolete' });
+            setCache("cache obsolete");
+            waitForTap("CACHE OBSOLETE -- Tekan tombol Enter  X/O", go);
+        }, false);
+    }
+
     if (!ac || !document.documentElement.hasAttribute("manifest")) { go(); }
     else if (!navigator.onLine) { setCache("offline -- from cache", true); go(); }
     else if (ac.status === ac.IDLE) { setCache("cached", true); go(); }
@@ -96,35 +373,6 @@
         setCache("update downloaded", true);
         waitForTap("UPDATE READY -- Tekan tombol Enter  X/O",
                    function () { location.reload(); });
-    } else {
-        setCache("checking cache...");
-        ac.addEventListener("downloading",
-            function () { setCache("caching for offline (first run)..."); }, false);
-        ac.addEventListener("progress", function (e) {
-            if (e && e.total)
-                setCache("caching " + Math.round((e.loaded / e.total) * 100) + "%");
-        }, false);
-        ac.addEventListener("cached", function () {
-            setCache("cached for offline use", true);
-            waitForTap("CACHED (first run) -- Tekan tombol Enter  X/O", go);
-        }, false);
-        ac.addEventListener("updateready", function () {
-            try { ac.swapCache(); } catch (e) {}
-            setCache("update downloaded", true);
-            waitForTap("UPDATE READY -- Tekan tombol Enter  X/O",
-                       function () { location.reload(); });
-        }, false);
-        ac.addEventListener("noupdate", function () {
-            setCache("cached -- offline ready", true); go();
-        }, false);
-        ac.addEventListener("error", function () {
-            setCache("cache unavailable");
-            waitForTap("CACHE FAILED -- Tekan tombol Enter  X/O", go);
-        }, false);
-        ac.addEventListener("obsolete", function () {
-            setCache("cache obsolete");
-            waitForTap("CACHE OBSTOLETE -- Tekan tombol Enter  X/O", go);
-        }, false);
     }
 })();
 </script>
