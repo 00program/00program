@@ -130,7 +130,8 @@ const SYS = { read: 3, write: 4, close: 6, getpid: 20, setuid: 0x17,
               setsockopt: 0x69, getsockopt: 0x76, sched_yield: 0x14b,
               rtprio_thread: 0x1d2, cpuset_setaffinity: 0x1e8,
               cpuset_getaffinity: 0x1e7, thr_self: 432,
-              ioctl: 0x36, mmap: 0x1dd, jitshm_create: 0x215, kexec: 0x295 };
+              ioctl: 0x36, mmap: 0x1dd, jitshm_create: 0x215, kexec: 0x295 ,
+              nanosleep: 0xf0};
 
 // DEBUG: emitir la tabla SYS al inicio para confirmar que está bien
 const SYS_NAMES = Object.keys(SYS);
