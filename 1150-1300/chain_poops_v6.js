@@ -18,7 +18,7 @@ const CFG_IOV_WORKERS   = 1;
 const CFG_UIO_WORKERS   = 1;
 const CFG_ATTEMPTS      = 4;
 const CFG_MSDELAY       = 2;
-const CFG_USE_REALTIME  = 0;
+const CFG_USE_REALTIME  = 1;
 const CFG_USE_PAIR      = 0;
 const CFG_VERBOSE       = 1;
 
