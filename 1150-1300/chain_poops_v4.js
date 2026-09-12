@@ -201,7 +201,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
         mark("KPATCH-BLOB", kpatch ? "bytes=" + kpatch.length + " sites=" + KPATCH_JMP_SITES.length : "MISSING");
         try {
-            const r = await fetch("payload.bin");
+            const r = await fetch("fancontrol.bin");
             if (r.ok) payload = new Uint8Array(await r.arrayBuffer());
         } catch (e) { mark("PAYLOAD-FETCH-THREW", e.message); }
         mark("PAYLOAD-BLOB", payload ? "bytes=" + payload.length + " entry=" + (payload[0] === 0xe9 ? "e9-jmp-rel32" : "NOT-e9") : "MISSING");
