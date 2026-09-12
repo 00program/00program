@@ -16,8 +16,8 @@ const STOP_BEFORE_DOUBLE = params.get("stop") === "beforedouble";
 // ============================================================
 // AJUSTES RÁPIDOS — edita SOLO estos números y vuelve a subir el archivo
 // ============================================================
-const CFG_IOV_WORKERS   = 1;   // workers para el iov spray (recvmsg parked)
-const CFG_UIO_WORKERS   = 1;   // workers para el UIO spray (readv/writev)
+const CFG_IOV_WORKERS   = 2;   // workers para el iov spray (recvmsg parked)
+const CFG_UIO_WORKERS   = 2;   // workers para el UIO spray (readv/writev)
 const CFG_ATTEMPTS      = 4;   // intentos del race
 const CFG_MSDELAY       = 2;   // ms entre dup() y close()
 const CFG_USE_REALTIME  = 0;   // 0 = sin pin RT; 1 = pinear a core 7
