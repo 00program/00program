@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ps4 poops v9</title>
+<title>ps4 poops v10</title>
 <style>
   html, body { margin:0; padding:0; background:#0b0d10; color:#c8ced8;
                font:15px/1.45 "Segoe UI", system-ui, sans-serif; }
@@ -17,11 +17,11 @@
 </head>
 <body>
 <div id="wrap">
-  <div id="state">loading poops v9...</div>
+  <div id="state">loading poops v10...</div>
   <div id="out"></div>
 </div>
 <script type="module">
-  import("./chain_poops_v9.js?force=1&t=" + Date.now())
+  import("./chain_poops_v10.js?force=1&t=" + Date.now())
     .catch(e => {
       document.getElementById("state").textContent = "LOAD-FAILED: " + e.message;
       document.getElementById("state").className = "bad";
